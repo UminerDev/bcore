@@ -317,6 +317,16 @@ target_link_libraries(mock_cosign_bridge
 # Make test_bitcoin depend on mock_cosign_bridge so it's always built
 add_dependencies(test_bitcoin mock_cosign_bridge)
 
+# Generate genuine VDF proofs through the same implementation used by the
+# node. The PyPI chiavdf API does not expose TensorCash's hash-to-form helper,
+# so functional tests invoke this binary instead of weakening verification.
+add_executable(vdf_test_helper vdf_test_helper.cpp)
+target_link_libraries(vdf_test_helper
+  core_interface
+  bitcoin_vdf
+)
+add_dependencies(test_bitcoin vdf_test_helper)
+
 # ML-DSA test helper for functional tests (key generation and signing)
 if(LIBOQS_LIB)
   # Add ML-DSA unit tests to test_bitcoin

@@ -15,6 +15,7 @@
 #include <shared_mutex>
 #include <optional>
 #include <limits>
+#include <stdexcept>
 #include <logging.h>
 #include <algorithm>
 #include <unordered_map>
@@ -53,6 +54,7 @@ private:
         CBlock block;
         std::chrono::steady_clock::time_point created_at;
         RequestState state{RequestState::Open};
+        std::optional<uint256> submitted_hash;
     };
 
 public:
@@ -65,6 +67,7 @@ public:
     struct LookupResult {
         LookupState state{LookupState::Missing};
         std::optional<CBlock> block;
+        std::optional<uint256> submitted_hash;
     };
 
 private:
@@ -98,7 +101,8 @@ public:
         // Add new request
         uint32_t new_id = (current_id_ % MAX_REQUEST_ID) + 1;
         current_id_ = new_id;
-        requests_[new_id] = RequestEntry{newRequest, now, RequestState::Open};
+        requests_[new_id] = RequestEntry{
+            newRequest, now, RequestState::Open, std::nullopt};
 
         // Keep size bounded: evict oldest first. Ties on created_at (bulk
         // minting within one clock tick) break on id so eviction order is
@@ -115,6 +119,27 @@ public:
         return new_id;
     }
 
+    // Restore or insert a caller-owned durable identifier. Broker mode uses
+    // this after fsyncing the corresponding work-unit journal entry, so a
+    // node restart cannot make a still-valid solution unrecoverable.
+    void storeWithId(uint32_t id, const CBlock& request) {
+        std::unique_lock lock(mutex_);
+        if (id == 0 || id >= MAX_REQUEST_ID) {
+            throw std::invalid_argument("request id outside durable tracker range");
+        }
+        auto now = std::chrono::steady_clock::now();
+        requests_[id] = RequestEntry{
+            request, now, RequestState::Open, std::nullopt};
+        while (requests_.size() > max_open_) {
+            auto oldest = std::min_element(requests_.begin(), requests_.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.second.created_at != b.second.created_at) return a.second.created_at < b.second.created_at;
+                    return a.first < b.first;
+                });
+            requests_.erase(oldest);
+        }
+    }
+
     LookupResult getRequestForSolution(uint32_t id) const {
         std::shared_lock lock(mutex_);
         auto it = requests_.find(id);
@@ -123,19 +148,21 @@ public:
         }
 
         if (it->second.state == RequestState::Submitted) {
-            return LookupResult{LookupState::Submitted, std::nullopt};
+            return LookupResult{
+                LookupState::Submitted, std::nullopt, it->second.submitted_hash};
         }
 
-        return LookupResult{LookupState::Available, it->second.block};
+        return LookupResult{LookupState::Available, it->second.block, std::nullopt};
     }
 
-    bool markSubmitted(uint32_t id) {
+    bool markSubmitted(uint32_t id, std::optional<uint256> submitted_hash = std::nullopt) {
         std::unique_lock lock(mutex_);
         auto it = requests_.find(id);
         if (it == requests_.end()) {
             return false;
         }
         it->second.state = RequestState::Submitted;
+        it->second.submitted_hash = submitted_hash;
         return true;
     }
 

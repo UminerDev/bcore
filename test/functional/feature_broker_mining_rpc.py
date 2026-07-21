@@ -17,6 +17,8 @@ constructing a valid `proof::MiningResponse` FlatBuffer in Python:
 - `submit_mining_response` returns structured rejection codes for
   invalid base64, malformed FlatBuffer, req_id out of range, and
   rpc/flatbuffer req_id mismatch.
+- Broker work units survive a node restart and remain releasable/submittable
+  under the original `req_id`.
 - `getmininginfo` exposes `tip_hash`, `tip_time`, `tip_age_seconds`.
 
 The valid-submission legs (accepted / already_submitted / unknown_req_id
@@ -27,6 +29,7 @@ available: `flatbuffers` (FlatBuffer serialisation) and `chiavdf`
 verification/quick_verifier.cpp VerifyVDF has no test bypass).
 """
 import base64
+import os
 import struct
 
 from test_framework.test_framework import BitcoinTestFramework
@@ -198,9 +201,12 @@ class BrokerMiningRpcTest(BitcoinTestFramework):
         # ------------------------------------------------------------------
         self.log.info("release_mining_work_unit erases an entry and is idempotent")
         unit_to_release = node.create_mining_work_unit(REGTEST_NETWORK, P2_OP_TRUE_HEX, "ff")
+        durable_ids = node.list_broker_mining_work_units()
+        assert unit_to_release["req_id"] in durable_ids, durable_ids
         released = node.release_mining_work_unit(unit_to_release["req_id"])
         assert_equal(released["req_id"], unit_to_release["req_id"])
         assert_equal(released["released"], True)
+        assert unit_to_release["req_id"] not in node.list_broker_mining_work_units()
 
         self.log.info("release_mining_work_unit second call returns released=false (idempotent no-op)")
         released_again = node.release_mining_work_unit(unit_to_release["req_id"])
@@ -238,6 +244,48 @@ class BrokerMiningRpcTest(BitcoinTestFramework):
         result = node.submit_mining_response(unit_to_release["req_id"], bogus_payload)
         assert_equal(result["accepted"], False)
 
+        self.log.info("durable work unit survives restart and remains releasable")
+        unit_release_after_restart = node.create_mining_work_unit(
+            REGTEST_NETWORK, P2_OP_TRUE_HEX, "ee"
+        )
+        self.restart_node(0)
+        node = self.nodes[0]
+        assert unit_release_after_restart["req_id"] in node.list_broker_mining_work_units()
+        released_after_restart = node.release_mining_work_unit(
+            unit_release_after_restart["req_id"]
+        )
+        assert_equal(released_after_restart["released"], True)
+
+        self.log.info("corrupt durable work unit makes startup reconciliation fail closed")
+        unit_corrupt = node.create_mining_work_unit(
+            REGTEST_NETWORK, P2_OP_TRUE_HEX, "ed"
+        )
+        journal = (
+            node.chain_path
+            / "broker-work-units"
+            / (str(unit_corrupt["req_id"]) + ".dat")
+        )
+        self.stop_node(0)
+        original = journal.read_bytes()
+        assert_greater_than(len(original), 32)
+        damaged = bytearray(original)
+        damaged[len(damaged) // 2] ^= 0x01
+        journal.write_bytes(damaged)
+        self.start_node(0)
+        node = self.nodes[0]
+        assert_raises_rpc_error(
+            -32603, "checksum mismatch", node.list_broker_mining_work_units
+        )
+        self.stop_node(0)
+        journal.write_bytes(original)
+        self.start_node(0)
+        node = self.nodes[0]
+        assert unit_corrupt["req_id"] in node.list_broker_mining_work_units()
+        assert_equal(
+            node.release_mining_work_unit(unit_corrupt["req_id"])["released"],
+            True,
+        )
+
         # ==================================================================
         # Done-when legs: valid MiningResponse round trips through
         # fillFromFB → QuickVerify → ProcessNewBlock. Requires both
@@ -262,6 +310,9 @@ class BrokerMiningRpcTest(BitcoinTestFramework):
         from test_framework.mining_response_builder import (
             build_mining_response,
             solve_work_unit,
+        )
+        os.environ["TSC_VDF_TEST_HELPER"] = str(
+            self.nodes[0].binary.parent / "vdf_test_helper"
         )
 
         # QuickVerifier::VerifyModelRegistration enforces that the proof's
@@ -301,6 +352,7 @@ class BrokerMiningRpcTest(BitcoinTestFramework):
         res_again = node.submit_mining_response(unit_win["req_id"], payload_win)
         assert_equal(res_again["accepted"], False)
         assert_equal(res_again["status"], "already_submitted")
+        assert_equal(res_again["block_hash"], res["block_hash"])
 
         self.log.info("stale-tip sibling: valid solve is stored as a side-chain block, tip unchanged")
         # The sibling was minted against the PREVIOUS tip, which is now the
@@ -350,6 +402,26 @@ class BrokerMiningRpcTest(BitcoinTestFramework):
         assert_equal(res_retry["status"], "accepted")
         assert_equal(node.getbestblockhash(), res_retry["block_hash"])
         assert_equal(node.getblockcount(), height_before + 2)
+
+        self.log.info("valid solved work unit submits under the same req_id after restart")
+        unit_restart = node.create_mining_work_unit(
+            REGTEST_NETWORK, P2_OP_TRUE_HEX, "0e"
+        )
+        sol_restart = solve_work_unit(
+            unit_restart["header_prefix"], unit_restart["target"]
+        )
+        payload_restart = build_mining_response(
+            unit_restart["req_id"], sol_restart, model_identifier=model_id
+        )
+        self.restart_node(0)
+        node = self.nodes[0]
+        res_restart = node.submit_mining_response(
+            unit_restart["req_id"], payload_restart
+        )
+        assert_equal(res_restart["status"], "accepted")
+        assert_equal(res_restart["accepted"], True)
+        assert_equal(node.getbestblockhash(), res_restart["block_hash"])
+        assert_equal(node.getblockcount(), height_before + 3)
 
         self.log.info("submit after release → unknown_req_id (valid payload)")
         unit_gone = node.create_mining_work_unit(REGTEST_NETWORK, P2_OP_TRUE_HEX, "0d")

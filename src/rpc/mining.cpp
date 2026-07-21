@@ -16,6 +16,7 @@
 #include <consensus/merkle.h>
 #include <consensus/params.h>
 #include <consensus/validation.h>
+#include <hash.h>
 #include <core_io.h>
 #include <deploymentinfo.h>
 #include <deploymentstatus.h>
@@ -29,6 +30,7 @@
 #include <policy/ephemeral_policy.h>
 #include <pow.h>
 #include <primitives/transaction.h>
+#include <random.h>
 #include <rpc/blockchain.h>
 #include <rpc/blockheader_generated.h>
 #include <rpc/mining.h>
@@ -38,9 +40,12 @@
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
+#include <streams.h>
 #include <txmempool.h>
 #include <univalue.h>
 #include <util/signalinterrupt.h>
+#include <util/fs.h>
+#include <util/fs_helpers.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/time.h>
@@ -136,6 +141,26 @@ void RecordOwnPendingBlock(const uint256& hash, int height, const uint256& prev_
             else ++it;
         }
     }
+}
+
+bool IsOwnPendingInFlight(ChainstateManager& chainman, const uint256& hash)
+{
+    {
+        LOCK(g_own_pending_mutex);
+        if (g_own_pending.find(hash) == g_own_pending.end()) return false;
+    }
+    if (g_ValidationApi != nullptr) {
+        const uint8_t own_full = g_ValidationApi->GetOwnFullStatus(hash);
+        if (own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Red) ||
+            own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Amber)) {
+            return false;
+        }
+    }
+    LOCK(cs_main);
+    const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hash);
+    if (pindex == nullptr) return true;
+    return !(pindex->nStatus & BLOCK_FAILED_MASK)
+        && !chainman.ActiveChain().Contains(pindex);
 }
 
 // Cumulative tick of `prev_hash`: from disk if its body is present, else from
@@ -1473,9 +1498,172 @@ namespace {
 // Process-local registry of broker-issued mining work units. A separate
 // tracker from ExtAPI's so the two paths cannot interfere.
 node::RequestTracker g_broker_work_units;
+Mutex g_broker_work_unit_journal_mutex;
 
 // SHA-256 hash size, mirrors ExtAPI::EXPECTED_HASH_SIZE (private there).
 constexpr size_t kBrokerExpectedHashSize = 32;
+constexpr uint32_t kBrokerWorkUnitJournalVersion = 1;
+
+fs::path BrokerWorkUnitJournalDir()
+{
+    return gArgs.GetDataDirNet() / "broker-work-units";
+}
+
+fs::path BrokerWorkUnitJournalPath(uint32_t req_id)
+{
+    return BrokerWorkUnitJournalDir() / fs::u8path(strprintf("%u.dat", req_id));
+}
+
+uint32_t PersistBrokerWorkUnit(const CBlock& block)
+{
+    LOCK(g_broker_work_unit_journal_mutex);
+    const fs::path dir = BrokerWorkUnitJournalDir();
+    std::error_code ec;
+    fs::create_directories(dir);
+
+    // Never evict an unknown on-disk work unit: it may contain the only block
+    // template capable of replaying an accepted_pending_connect proof. Stop
+    // issuing new work instead and require operator reconciliation.
+    size_t entries{0};
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file() && entry.path().extension() == ".dat") ++entries;
+    }
+    if (ec) {
+        throw std::runtime_error(strprintf(
+            "scan broker work-unit journal %s: %s",
+            fs::PathToString(dir), ec.message()));
+    }
+    if (entries >= node::MaxMiningWorkUnitsFromArgs()) {
+        throw std::runtime_error(strprintf(
+            "broker work-unit journal is full (%zu entries); refusing unsafe eviction",
+            entries));
+    }
+
+    FastRandomContext rng;
+    for (int attempt = 0; attempt < 1024; ++attempt) {
+        const uint32_t req_id = static_cast<uint32_t>(
+            1 + rng.randrange(static_cast<uint64_t>(MAX_REQUEST_ID - 1)));
+        const fs::path path = BrokerWorkUnitJournalPath(req_id);
+        if (fs::exists(path)) continue;
+
+        const fs::path temp = dir / fs::u8path(strprintf(
+            ".%u.%s.tmp", req_id, ToString(rng.rand64())));
+        AutoFile file{fsbridge::fopen(temp, "wb")};
+        if (file.IsNull()) {
+            throw std::runtime_error(strprintf(
+                "open broker work-unit journal temp %s", fs::PathToString(temp)));
+        }
+        try {
+            HashWriter hasher;
+            hasher << kBrokerWorkUnitJournalVersion << req_id << TX_WITH_WITNESS(block);
+            const uint256 checksum = hasher.GetHash();
+            file << kBrokerWorkUnitJournalVersion << req_id << TX_WITH_WITNESS(block) << checksum;
+        } catch (...) {
+            file.fclose();
+            fs::remove(temp, ec);
+            throw;
+        }
+        if (!file.Commit()) {
+            file.fclose();
+            fs::remove(temp, ec);
+            throw std::runtime_error("fsync broker work-unit journal failed");
+        }
+        file.fclose();
+        if (!RenameOver(temp, path)) {
+            fs::remove(temp, ec);
+            throw std::runtime_error("publish broker work-unit journal failed");
+        }
+        DirectoryCommit(dir);
+        return req_id;
+    }
+    throw std::runtime_error("cannot allocate collision-free broker work-unit id");
+}
+
+std::optional<CBlock> LoadBrokerWorkUnitLocked(uint32_t req_id)
+    EXCLUSIVE_LOCKS_REQUIRED(g_broker_work_unit_journal_mutex)
+{
+    const fs::path path = BrokerWorkUnitJournalPath(req_id);
+    if (!fs::exists(path)) return std::nullopt;
+    AutoFile file{fsbridge::fopen(path, "rb")};
+    if (file.IsNull()) {
+        throw std::runtime_error(strprintf(
+            "open broker work-unit journal %s", fs::PathToString(path)));
+    }
+    uint32_t version{0};
+    uint32_t stored_id{0};
+    CBlock block;
+    uint256 checksum;
+    file >> version >> stored_id >> TX_WITH_WITNESS(block) >> checksum;
+    if (version != kBrokerWorkUnitJournalVersion || stored_id != req_id) {
+        throw std::runtime_error(strprintf(
+            "broker work-unit journal identity mismatch for %u", req_id));
+    }
+    HashWriter hasher;
+    hasher << version << stored_id << TX_WITH_WITNESS(block);
+    if (hasher.GetHash() != checksum) {
+        throw std::runtime_error(strprintf(
+            "broker work-unit journal checksum mismatch for %u", req_id));
+    }
+    return block;
+}
+
+std::optional<CBlock> LoadBrokerWorkUnit(uint32_t req_id)
+{
+    LOCK(g_broker_work_unit_journal_mutex);
+    return LoadBrokerWorkUnitLocked(req_id);
+}
+
+std::vector<uint32_t> ListBrokerWorkUnits()
+{
+    LOCK(g_broker_work_unit_journal_mutex);
+    const fs::path dir = BrokerWorkUnitJournalDir();
+    std::error_code ec;
+    if (!fs::exists(dir)) return {};
+
+    std::vector<uint32_t> ids;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file() || entry.path().extension() != ".dat") continue;
+        uint32_t req_id{0};
+        const std::string stem = fs::PathToString(entry.path().stem());
+        if (!ParseUInt32(stem, &req_id) || req_id == 0 || req_id >= MAX_REQUEST_ID) {
+            throw std::runtime_error(strprintf(
+                "invalid broker work-unit journal filename %s",
+                fs::PathToString(entry.path())));
+        }
+        // Startup reconciliation must fail closed when a durable entry is
+        // corrupt. Merely listing a filename would let the broker believe an
+        // in-flight block attempt remains recoverable when its template is not.
+        (void)LoadBrokerWorkUnitLocked(req_id);
+        ids.push_back(req_id);
+    }
+    if (ec) {
+        throw std::runtime_error(strprintf(
+            "scan broker work-unit journal %s: %s",
+            fs::PathToString(dir), ec.message()));
+    }
+    std::sort(ids.begin(), ids.end());
+    if (std::adjacent_find(ids.begin(), ids.end()) != ids.end()) {
+        throw std::runtime_error("duplicate broker work-unit journal identifier");
+    }
+    return ids;
+}
+
+bool RemoveBrokerWorkUnit(uint32_t req_id)
+{
+    LOCK(g_broker_work_unit_journal_mutex);
+    const fs::path path = BrokerWorkUnitJournalPath(req_id);
+    std::error_code ec;
+    const bool removed = fs::remove(path, ec);
+    if (ec) {
+        throw std::runtime_error(strprintf(
+            "remove broker work-unit journal %s: %s",
+            fs::PathToString(path), ec.message()));
+    }
+    if (removed) DirectoryCommit(BrokerWorkUnitJournalDir());
+    return removed;
+}
 
 // Encode the 76-byte block-header prefix (everything except the 4-byte
 // nNonce trailer). Mirrors the layout the miner-proxy/broker already
@@ -1685,9 +1873,6 @@ static RPCHelpMan create_mining_work_unit()
     }()};
     (void)cap_configured;
 
-    // Register in broker tracker -> mint req_id.
-    const uint32_t req_id = g_broker_work_units.incrementAndStore(block);
-
     // Compute target from nBits (mirrors mining.cpp:996 idiom).
     bool fNegative = false;
     bool fOverflow = false;
@@ -1697,6 +1882,19 @@ static RPCHelpMan create_mining_work_unit()
         throw JSONRPCError(RPC_INTERNAL_ERROR, "invalid nBits in assembled block");
     }
     const uint256 target = ArithToUint256(bn_target);
+
+    // Journal only after all template validation has succeeded and before
+    // exposing req_id. The broker can retain the matching raw solution and
+    // replay it after a node restart; the node restores this exact block
+    // template from disk instead of returning unknown_req_id.
+    uint32_t req_id{0};
+    try {
+        req_id = PersistBrokerWorkUnit(block);
+        g_broker_work_units.storeWithId(req_id, block);
+    } catch (const std::exception& e) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf(
+            "persist broker mining work unit: %s", e.what()));
+    }
 
     // RequestTracker uses steady_clock with REQUEST_EXPIRY = 10 minutes
     // (extapi.h:63). Expose the wall-clock equivalent for the broker's lease.
@@ -1802,13 +2000,27 @@ static RPCHelpMan submit_mining_response()
     // Look up the stored block by req_id.
     auto lookup = g_broker_work_units.getRequestForSolution(req_id);
     if (lookup.state == node::RequestTracker::LookupState::Submitted) {
-        return reject("already_submitted", "");
+        UniValue submitted(UniValue::VOBJ);
+        submitted.pushKV("accepted", false);
+        submitted.pushKV("status", "already_submitted");
+        if (lookup.submitted_hash) {
+            submitted.pushKV("block_hash", lookup.submitted_hash->ToString());
+        }
+        return submitted;
     }
+    std::optional<CBlock> durable_block;
     if (lookup.state == node::RequestTracker::LookupState::Missing || !lookup.block.has_value()) {
-        return reject("unknown_req_id", "");
+        try {
+            durable_block = LoadBrokerWorkUnit(req_id);
+        } catch (const std::exception& e) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf(
+                "load durable broker work unit %u: %s", req_id, e.what()));
+        }
+        if (!durable_block) return reject("unknown_req_id", "");
+        g_broker_work_units.storeWithId(req_id, *durable_block);
     }
 
-    CBlock block = *lookup.block;
+    CBlock block = lookup.block.has_value() ? *lookup.block : *durable_block;
     block.nNonce = resp->nonce();
     block.nAdjBits = resp->adjusted_bits();
 
@@ -1870,8 +2082,16 @@ static RPCHelpMan submit_mining_response()
         return reject("quick_verify_failed", quick_verifier.GetLastError());
     }
 
-    // Submit through the same path SolutionReceiverLoop uses (extapi.cpp:460-492).
     const uint256 block_hash = block.GetHash();
+    if (IsOwnPendingInFlight(chainman, block_hash)) {
+        UniValue pending(UniValue::VOBJ);
+        pending.pushKV("accepted", false);
+        pending.pushKV("status", "accepted_pending_connect");
+        pending.pushKV("block_hash", block_hash.ToString());
+        return pending;
+    }
+
+    // Submit through the same path SolutionReceiverLoop uses (extapi.cpp:460-492).
     auto blockPtr = std::make_shared<const CBlock>(std::move(block));
     auto sc = std::make_shared<submitblock_StateCatcher>(block_hash);
     CHECK_NONFATAL(chainman.m_options.signals)->RegisterSharedValidationInterface(sc);
@@ -1950,7 +2170,7 @@ static RPCHelpMan submit_mining_response()
     // still make it active, and reconciliation owns that transition.
     if (accepted) {
         if (block_active_with_data()) {
-            g_broker_work_units.markSubmitted(req_id);
+            g_broker_work_units.markSubmitted(req_id, block_hash);
             r.pushKV("accepted", true);
             r.pushKV("status", "accepted");
             return r;
@@ -1970,7 +2190,7 @@ static RPCHelpMan submit_mining_response()
         constexpr int kMaxIters = 225;  // 225 * 200ms = 45s, inside the 60s broker budget
         for (int i = 0; i < kMaxIters && !chainman.m_interrupt; ++i) {
             if (block_active_with_data()) {
-                g_broker_work_units.markSubmitted(req_id);
+                g_broker_work_units.markSubmitted(req_id, block_hash);
                 r.pushKV("accepted", true);
                 r.pushKV("status", "accepted");
                 return r;
@@ -2045,13 +2265,54 @@ static RPCHelpMan release_mining_work_unit()
     }
     const uint32_t req_id = static_cast<uint32_t>(req_id_in);
 
-    const bool released = g_broker_work_units.remove(req_id);
+    const bool memory_released = g_broker_work_units.remove(req_id);
+    bool disk_released{false};
+    try {
+        disk_released = RemoveBrokerWorkUnit(req_id);
+    } catch (const std::exception& e) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf(
+            "release durable broker work unit %u: %s", req_id, e.what()));
+    }
+    const bool released = memory_released || disk_released;
 
     UniValue r(UniValue::VOBJ);
     r.pushKV("req_id", static_cast<uint64_t>(req_id));
     r.pushKV("released", released);
     return r;
 },
+    };
+}
+
+static RPCHelpMan list_broker_mining_work_units()
+{
+    return RPCHelpMan{"list_broker_mining_work_units",
+        "List durable broker-issued work-unit identifiers. A broker uses this "
+        "during startup recovery to retain IDs referenced by its block-attempt "
+        "or candidate WAL and release abandoned ordinary leases.\n",
+        {},
+        RPCResult{RPCResult::Type::ARR, "", "Durable work-unit identifiers",
+        {
+            {RPCResult::Type::NUM, "", "req_id returned by create_mining_work_unit"},
+        }},
+        RPCExamples{
+            HelpExampleCli("list_broker_mining_work_units", "")
+            + HelpExampleRpc("list_broker_mining_work_units", "")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+    {
+        std::vector<uint32_t> ids;
+        try {
+            ids = ListBrokerWorkUnits();
+        } catch (const std::exception& e) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, strprintf(
+                "list durable broker work units: %s", e.what()));
+        }
+        UniValue result(UniValue::VARR);
+        for (const uint32_t req_id : ids) {
+            result.push_back(static_cast<uint64_t>(req_id));
+        }
+        return result;
+    },
     };
 }
 
@@ -2068,6 +2329,7 @@ void RegisterMiningRPCCommands(CRPCTable& t)
         {"mining", &create_mining_work_unit},
         {"mining", &submit_mining_response},
         {"mining", &release_mining_work_unit},
+        {"mining", &list_broker_mining_work_units},
 
         {"hidden", &generatetoaddress},
         {"hidden", &generatetodescriptor},

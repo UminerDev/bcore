@@ -336,6 +336,33 @@ BOOST_AUTO_TEST_CASE(request_tracker_default_cap_retains_pool_scale_work_units)
     }
 }
 
+BOOST_AUTO_TEST_CASE(request_tracker_restores_caller_owned_durable_id)
+{
+    node::RequestTracker tracker;
+    CBlock block;
+    block.nNonce = 77;
+    tracker.storeWithId(9'999'999, block);
+    const auto restored = tracker.getRequestForSolution(9'999'999);
+    BOOST_REQUIRE(restored.state == node::RequestTracker::LookupState::Available);
+    BOOST_REQUIRE(restored.block.has_value());
+    BOOST_CHECK_EQUAL(restored.block->nNonce, 77U);
+    BOOST_CHECK_THROW(tracker.storeWithId(0, block), std::invalid_argument);
+}
+
+BOOST_AUTO_TEST_CASE(request_tracker_retains_submitted_block_hash)
+{
+    node::RequestTracker tracker;
+    CBlock block;
+    const uint32_t id = tracker.incrementAndStore(block);
+    const uint256 submitted_hash{uint256::ONE};
+    BOOST_REQUIRE(tracker.markSubmitted(id, submitted_hash));
+
+    const auto submitted = tracker.getRequestForSolution(id);
+    BOOST_CHECK(submitted.state == node::RequestTracker::LookupState::Submitted);
+    BOOST_REQUIRE(submitted.submitted_hash.has_value());
+    BOOST_CHECK_EQUAL(submitted.submitted_hash->ToString(), submitted_hash.ToString());
+}
+
 BOOST_AUTO_TEST_CASE(request_tracker_evicts_oldest_beyond_cap)
 {
     node::RequestTracker tracker;

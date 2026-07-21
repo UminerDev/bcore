@@ -5,7 +5,9 @@
 """VDF proof generation helper for TensorCash functional tests."""
 
 import hashlib
+import os
 import struct
+import subprocess
 from io import BytesIO
 from typing import Dict, Optional, Tuple
 from test_framework.messages import CProofBlob
@@ -111,6 +113,20 @@ def generate_vdf_proof(challenge: bytes, iterations: int, discriminant_size_bits
     vector_key = (challenge_hex, iterations, discriminant_size_bits)
     if vector_key in TEST_VECTORS:
         return bytes.fromhex(TEST_VECTORS[vector_key])
+
+    helper = os.environ.get("TSC_VDF_TEST_HELPER")
+    if helper:
+        if discriminant_size_bits != 1024:
+            raise ValueError("vdf_test_helper supports only the consensus 1024-bit profile")
+        # uint256's display hex is the reverse of the raw 32 bytes carried in
+        # the block header. The helper converts it back to the exact internal
+        # byte span consumed by GenerateProofForTesting.
+        proof_hex = subprocess.check_output(
+            [helper, challenge[::-1].hex(), str(iterations)],
+            text=True,
+            timeout=120,
+        ).strip()
+        return bytes.fromhex(proof_hex)
 
     if HAS_CHIAVDF:
         # Generate real proof using chiavdf
