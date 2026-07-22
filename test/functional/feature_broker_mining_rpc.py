@@ -31,6 +31,7 @@ verification/quick_verifier.cpp VerifyVDF has no test bypass).
 import base64
 import os
 import struct
+from pathlib import Path
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
@@ -312,7 +313,9 @@ class BrokerMiningRpcTest(BitcoinTestFramework):
             solve_work_unit,
         )
         os.environ["TSC_VDF_TEST_HELPER"] = str(
-            self.nodes[0].binary.parent / "vdf_test_helper"
+            Path(self.config["environment"]["BUILDDIR"])
+            / "bin"
+            / "vdf_test_helper"
         )
 
         # QuickVerifier::VerifyModelRegistration enforces that the proof's

@@ -323,6 +323,7 @@ add_dependencies(test_bitcoin mock_cosign_bridge)
 add_executable(vdf_test_helper vdf_test_helper.cpp)
 target_link_libraries(vdf_test_helper
   core_interface
+  bitcoin_util
   bitcoin_vdf
 )
 add_dependencies(test_bitcoin vdf_test_helper)
@@ -338,6 +339,7 @@ if(LIBOQS_LIB)
     bitcoin_crypto
     ${LIBOQS_LIB}
   )
+  target_include_directories(mldsa_test_helper PRIVATE ${LIBOQS_INCLUDE_DIR})
   target_compile_definitions(mldsa_test_helper PRIVATE ENABLE_MLDSA)
   add_dependencies(test_bitcoin mldsa_test_helper)
   target_compile_definitions(test_bitcoin PRIVATE ENABLE_MLDSA)

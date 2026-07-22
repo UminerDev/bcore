@@ -1380,6 +1380,11 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
             last_status = status_code;
             if (status_code >= 200 && status_code < 300) {
                 EnqueueStatusRequest(req_id, req_type);
+                // A successful submit transfers ownership to the validator.
+                // Mark it pending immediately instead of waiting for the next
+                // status poll; otherwise the scheduler can resend the same
+                // expensive Full request during that observation gap.
+                MarkHttpStatusAcceptedPending(StatusKey{req_id, req_type});
                 return status_code;
             }
 
@@ -1554,7 +1559,7 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
         }
         for (const auto& key : snapshot) {
             if (pending_keys.count(key) > 0) {
-                MarkHttpStatusAcceptedPending(key, now_ms);
+                MarkHttpStatusAcceptedPending(key);
                 if (review_pending_keys.count(key) > 0) {
                     std::lock_guard<std::mutex> lock(status_queue_mutex_);
                     model_review_pending_.insert(key);
@@ -1652,7 +1657,7 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 if (expired_age || expired_misses) {
                     status_queue_set_.erase(item);
                     http_status_accepted_pending_.erase(item);
-                    http_status_accepted_pending_since_ms_.erase(item);
+                    http_status_accepted_pending_since_.erase(item);
                     status_queue_meta_.erase(item);
                     expired_items.push_back(item);
                     continue;
@@ -1709,7 +1714,7 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 const UniValue& state_val = root.find_value("state");
                 const bool is_review = (status_str == "Model_Pending_Review") ||
                                        (state_val.isStr() && state_val.get_str() == "pending_operator_review");
-                MarkHttpStatusAcceptedPending(item, now_ms);
+                MarkHttpStatusAcceptedPending(item);
                 if (is_review) {
                     std::lock_guard<std::mutex> lock(status_queue_mutex_);
                     model_review_pending_.insert(item);
@@ -1884,7 +1889,7 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 if (expired_age || expired_misses) {
                     status_queue_set_.erase(item);
                     http_status_accepted_pending_.erase(item);
-                    http_status_accepted_pending_since_ms_.erase(item);
+                    http_status_accepted_pending_since_.erase(item);
                     status_queue_meta_.erase(item);
                     dropped = true;
                     break;
@@ -2242,7 +2247,7 @@ void ValidationAPI::JobSchedulerLoop() {
             if (!UseHttpTransport() || !IsHttpStatusAcceptedPending(id, type)) {
                 return false;
             }
-            if (IsHttpStatusAcceptedPendingStale(id, type, now)) {
+            if (IsHttpStatusAcceptedPendingStale(id, type)) {
                 LogWarning("VALIDATOR HTTP status pending expired for %s type=%d after %llums; resuming retries\n",
                            id.ToString().c_str(),
                            static_cast<int>(type),

@@ -459,6 +459,7 @@ target_link_libraries(bitcoin_node
   PRIVATE
     core_interface
     bitcoin_common
+    secp256k1
     bitcoin_vdf
     bitcoin_util
     $<TARGET_NAME_IF_EXISTS:bitcoin_zmq>

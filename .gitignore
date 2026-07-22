@@ -8,6 +8,10 @@
 !/build-aux
 !/build_msvc
 
+# Populated from the TensorCash umbrella repository by the reproducible node
+# build. These dependency copies are build inputs, not bcore-owned sources.
+/src/external/
+
 *.pyc
 
 # Only ignore unexpected patches

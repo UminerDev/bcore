@@ -706,21 +706,33 @@ BOOST_AUTO_TEST_CASE(http_pending_guard_expires_short_requests)
     auto api = MakeValidationApi(m_node);
     const uint256 id = DeterministicId();
     const ValidationAPI::StatusKey key{id, ValidationReqType::Quick_Smell};
-    constexpr uint64_t now_ms = 1'000;
 
-    api.MarkHttpStatusAcceptedPending(key, now_ms);
+    api.MarkHttpStatusAcceptedPending(key);
     BOOST_CHECK(api.IsHttpStatusAcceptedPending(id, ValidationReqType::Quick_Smell));
-    BOOST_CHECK(!api.IsHttpStatusAcceptedPendingStale(
-        id,
-        ValidationReqType::Quick_Smell,
-        now_ms + ValidationAPI::HTTP_PENDING_MAX_AGE_SHORT_MS - 1));
-    BOOST_CHECK(api.IsHttpStatusAcceptedPendingStale(
-        id,
-        ValidationReqType::Quick_Smell,
-        now_ms + ValidationAPI::HTTP_PENDING_MAX_AGE_SHORT_MS));
+    BOOST_CHECK(!api.IsHttpStatusAcceptedPendingStale(id, ValidationReqType::Quick_Smell));
+
+    api.http_status_accepted_pending_since_[key] = std::chrono::steady_clock::now() -
+        std::chrono::milliseconds(ValidationAPI::HTTP_PENDING_MAX_AGE_SHORT_MS + 1);
+    BOOST_CHECK(api.IsHttpStatusAcceptedPendingStale(id, ValidationReqType::Quick_Smell));
 
     api.ClearHttpStatusAcceptedPending(key);
     BOOST_CHECK(!api.IsHttpStatusAcceptedPending(id, ValidationReqType::Quick_Smell));
+}
+
+BOOST_AUTO_TEST_CASE(http_pending_guard_uses_full_request_deadline)
+{
+    auto api = MakeValidationApi(m_node);
+    const uint256 id = DeterministicId();
+    const ValidationAPI::StatusKey key{id, ValidationReqType::Full};
+
+    api.MarkHttpStatusAcceptedPending(key);
+    api.http_status_accepted_pending_since_[key] = std::chrono::steady_clock::now() -
+        std::chrono::milliseconds(ValidationAPI::HTTP_PENDING_MAX_AGE_SHORT_MS + 1);
+    BOOST_CHECK(!api.IsHttpStatusAcceptedPendingStale(id, ValidationReqType::Full));
+
+    api.http_status_accepted_pending_since_[key] = std::chrono::steady_clock::now() -
+        std::chrono::milliseconds(ValidationAPI::HTTP_PENDING_MAX_AGE_LONG_MS + 1);
+    BOOST_CHECK(api.IsHttpStatusAcceptedPendingStale(id, ValidationReqType::Full));
 }
 
 BOOST_AUTO_TEST_CASE(http_status_queue_reconciles_tracked_quick_smell_request)
@@ -894,7 +906,7 @@ BOOST_AUTO_TEST_CASE(public_terminal_hit_resets_all_backoff)
     api.status_queue_set_.insert(key);
     api.status_queue_meta_[key] = ValidationAPI::StatusQueueMeta{1000, 1200, 800, 5};
     api.http_status_accepted_pending_.insert(key);
-    api.http_status_accepted_pending_since_ms_[key] = 1000;
+    api.http_status_accepted_pending_since_[key] = std::chrono::steady_clock::now();
     api.public_error_backoff_ms_.store(4000);
 
     // Terminal hit clears per-item NAN state and resets transport/rate-limit backoff.
@@ -904,7 +916,7 @@ BOOST_AUTO_TEST_CASE(public_terminal_hit_resets_all_backoff)
     BOOST_CHECK_EQUAL(api.status_queue_set_.count(key), 0U);
     BOOST_CHECK_EQUAL(api.status_queue_meta_.count(key), 0U);
     BOOST_CHECK_EQUAL(api.http_status_accepted_pending_.count(key), 0U);
-    BOOST_CHECK_EQUAL(api.http_status_accepted_pending_since_ms_.count(key), 0U);
+    BOOST_CHECK_EQUAL(api.http_status_accepted_pending_since_.count(key), 0U);
     BOOST_CHECK_EQUAL(api.public_error_backoff_ms_.load(), 0);
 }
 

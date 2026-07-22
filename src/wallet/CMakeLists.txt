@@ -78,6 +78,8 @@ add_library(bitcoin_wallet STATIC EXCLUDE_FROM_ALL
   walletutil.cpp
 )
 target_link_libraries(bitcoin_wallet
+  PRIVATE
+    secp256k1
   PUBLIC
     core_interface
     bitcoin_common

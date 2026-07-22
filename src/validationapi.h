@@ -620,28 +620,28 @@ private:
             return HTTP_PUBLIC_NAN_MAX_POLLS_SHORT;
         }
     }
-    bool IsHttpStatusAcceptedPendingStale(const uint256& req_id, const ValidationReqType& req_type, const uint64_t now_ms) {
+    bool IsHttpStatusAcceptedPendingStale(const uint256& req_id, const ValidationReqType& req_type) {
         std::lock_guard<std::mutex> lock(status_queue_mutex_);
         const StatusKey key{req_id, req_type};
         if (http_status_accepted_pending_.count(key) == 0) {
             return false;
         }
-        const auto it = http_status_accepted_pending_since_ms_.find(key);
-        if (it == http_status_accepted_pending_since_ms_.end()) {
+        const auto it = http_status_accepted_pending_since_.find(key);
+        if (it == http_status_accepted_pending_since_.end()) {
             return false;
         }
-        if (now_ms < it->second) {
-            return false;
-        }
+        const auto age = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - it->second);
+        if (age.count() < 0) return false;
         // Operator-review-pending entries get a much longer timeout (24h vs 5min)
         if (model_review_pending_.count(key) > 0) {
-            if ((now_ms - it->second) >= HTTP_PENDING_MAX_AGE_MODEL_REVIEW_MS) {
+            if (static_cast<uint64_t>(age.count()) >= HTTP_PENDING_MAX_AGE_MODEL_REVIEW_MS) {
                 model_review_pending_.erase(key);
                 return true;  // Expired — retries resume, caller applies req-type default
             }
             return false;  // Still within 24h review window
         }
-        return now_ms - it->second >= HttpPendingMaxAgeMs(req_type);
+        return static_cast<uint64_t>(age.count()) >= HttpPendingMaxAgeMs(req_type);
     }
     bool IsOperatorReviewPending(const uint256& id, const ValidationReqType& req_type) const {
         std::lock_guard<std::mutex> lock(status_queue_mutex_);
@@ -657,10 +657,10 @@ private:
     void ClearModelReviewPending(const uint256& id) {
         ClearOperatorReviewPending(id, ValidationReqType::Model);
     }
-    void MarkHttpStatusAcceptedPending(const StatusKey& key, const uint64_t now_ms) {
+    void MarkHttpStatusAcceptedPending(const StatusKey& key) {
         std::lock_guard<std::mutex> lock(status_queue_mutex_);
         http_status_accepted_pending_.insert(key);
-        http_status_accepted_pending_since_ms_.try_emplace(key, now_ms);
+        http_status_accepted_pending_since_.try_emplace(key, std::chrono::steady_clock::now());
     }
     void ClearStatusQueueEntry(const StatusKey& key) {
         std::lock_guard<std::mutex> lock(status_queue_mutex_);
@@ -670,20 +670,20 @@ private:
         }
         status_queue_set_.erase(key);
         http_status_accepted_pending_.erase(key);
-        http_status_accepted_pending_since_ms_.erase(key);
+        http_status_accepted_pending_since_.erase(key);
         status_queue_meta_.erase(key);
     }
     void ClearHttpStatusAcceptedPending(const StatusKey& key) {
         std::lock_guard<std::mutex> lock(status_queue_mutex_);
         http_status_accepted_pending_.erase(key);
-        http_status_accepted_pending_since_ms_.erase(key);
+        http_status_accepted_pending_since_.erase(key);
     }
     mutable std::mutex status_queue_mutex_;
     std::deque<StatusKey> status_queue_;
     std::unordered_set<StatusKey, StatusKeyHasher> status_queue_set_;
     std::unordered_map<StatusKey, StatusQueueMeta, StatusKeyHasher> status_queue_meta_;
     std::unordered_set<StatusKey, StatusKeyHasher> http_status_accepted_pending_;
-    std::unordered_map<StatusKey, uint64_t, StatusKeyHasher> http_status_accepted_pending_since_ms_;
+    std::unordered_map<StatusKey, std::chrono::steady_clock::time_point, StatusKeyHasher> http_status_accepted_pending_since_;
     std::unordered_set<StatusKey, StatusKeyHasher> model_review_pending_;  // Requests awaiting operator review (24h timeout)
     // Auth batch error backoff: escalates on fast failures (5xx, connection error),
     // resets on any successful long-poll response.
