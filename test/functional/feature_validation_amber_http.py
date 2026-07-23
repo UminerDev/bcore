@@ -43,7 +43,12 @@ class ValidatorStubHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # The shutdown regression deliberately aborts an in-flight status
+            # response; the node closing this socket is the expected result.
+            pass
 
     def _status_for(self, verification_type):
         vt = verification_type.replace("_", "-")
@@ -59,6 +64,9 @@ class ValidatorStubHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(length) if length else b""
         if "/v1/verify/status/batch" in self.path:
+            if self.server.block_status_responses:
+                self.server.status_response_entered.set()
+                self.server.release_status_response.wait(timeout=30)
             req = json.loads(body.decode())
             completed = []
             for item in req.get("items", []):
@@ -98,6 +106,9 @@ class ValidationAmberHttpTest(BitcoinTestFramework):
     def setup_nodes(self):
         self.stub = ThreadingHTTPServer(("127.0.0.1", 0), ValidatorStubHandler)
         self.stub.full_status = "Full_Amber"
+        self.stub.block_status_responses = False
+        self.stub.status_response_entered = threading.Event()
+        self.stub.release_status_response = threading.Event()
         self.stub_thread = threading.Thread(target=self.stub.serve_forever, daemon=True)
         self.stub_thread.start()
         self.extra_args[VALIDATED] = [
@@ -196,6 +207,23 @@ class ValidationAmberHttpTest(BitcoinTestFramework):
         assert_equal(result["chain_action"], "accepted")
         assert_equal(result["evidence_sha256"], evidence_sha256)
         assert_equal(validated.getbestblockhash(), block_hash)
+
+        # Shutdown must interrupt an in-flight synchronous HTTP read. Without
+        # explicit socket shutdown, Linux may leave recv() blocked until each
+        # configured endpoint timeout expires, delaying process exit by
+        # minutes and making production restarts unreliable.
+        next_block_hash = self.generate(miner, 1, sync_fun=self.no_op)[0]
+        self.stub.block_status_responses = True
+        validated.submitblock(miner.getblock(next_block_hash, 0))
+        assert self.stub.status_response_entered.wait(timeout=10), "validator status request did not enter the blocking stub"
+        release_timer = threading.Timer(10, self.stub.release_status_response.set)
+        release_timer.start()
+        shutdown_started = time.monotonic()
+        validated.stop_node()
+        shutdown_elapsed = time.monotonic() - shutdown_started
+        release_timer.cancel()
+        self.stub.release_status_response.set()
+        assert shutdown_elapsed < 5, f"node shutdown took {shutdown_elapsed:.2f}s with HTTP status read in flight"
 
         self.stub.shutdown()
 

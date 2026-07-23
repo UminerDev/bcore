@@ -494,6 +494,21 @@ public:
 
 private:
     // Helpers
+    class HttpRequestGuard {
+    public:
+        HttpRequestGuard(ValidationAPI& owner, std::function<void()> cancel);
+        ~HttpRequestGuard();
+        HttpRequestGuard(const HttpRequestGuard&) = delete;
+        HttpRequestGuard& operator=(const HttpRequestGuard&) = delete;
+
+    private:
+        ValidationAPI& owner_;
+        uint64_t token_{0};
+    };
+
+    uint64_t RegisterHttpCancellation(std::function<void()> cancel);
+    void UnregisterHttpCancellation(uint64_t token);
+    void CancelHttpRequests();
     ValidationResponseValue RunLocalQuick(const CBlock& block);
     bool TrySetLocalQuickSmellFinalHashFailure(const CBlock& block);
     bool TryFetchPublicStatusSync(const uint256& req_id, const ValidationReqType& req_type);
@@ -542,6 +557,9 @@ private:
 
     std::atomic<bool> waitingApiAnswer{false};
     std::atomic<bool> m_on{false};
+    std::mutex http_requests_mutex_;
+    uint64_t next_http_request_token_{0};
+    std::unordered_map<uint64_t, std::function<void()>> active_http_requests_;
     
     // New members for monitoring and protection
     RateLimiter rateLimiter_;

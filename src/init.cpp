@@ -321,6 +321,12 @@ void Shutdown(NodeContext& node)
     StopTorControl();
 
     if (node.background_init_thread.joinable()) node.background_init_thread.join();
+    // ValidationAPI owns worker threads and keeps references to chainman and
+    // connman. Destroy it after network/background processing has stopped,
+    // but before either referenced object is released. Leaving this to static
+    // destruction can hang process exit on an in-flight HTTP status request
+    // and risks accessing an already-destroyed chainman.
+    g_ValidationApi.reset();
     // The reorg-gate hooks reference the scheduler and chainman; drop them
     // before either is torn down. Pending gates/vetoes are in-memory only and
     // die with the process (a restart may re-prompt but never auto-accepts).

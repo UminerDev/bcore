@@ -27,6 +27,7 @@
 #include <tuple>
 #include <array>
 #include <optional>
+#include <stdexcept>
 #include <sync.h>
 #include <algorithm>
 #include <chain.h>
@@ -579,6 +580,52 @@ ValidationAPI::ValidationAPI(ChainstateManager& chainman, const Consensus::Param
     LogPrintf("ValidationAPI initialized with push=%s, pull=%s\n", addressPush, addressPull);
 }
 
+ValidationAPI::HttpRequestGuard::HttpRequestGuard(ValidationAPI& owner, std::function<void()> cancel)
+    : owner_{owner}, token_{owner_.RegisterHttpCancellation(std::move(cancel))}
+{
+    if (token_ == 0) {
+        throw std::runtime_error{"validation HTTP request interrupted during shutdown"};
+    }
+}
+
+ValidationAPI::HttpRequestGuard::~HttpRequestGuard()
+{
+    if (token_ != 0) {
+        owner_.UnregisterHttpCancellation(token_);
+    }
+}
+
+uint64_t ValidationAPI::RegisterHttpCancellation(std::function<void()> cancel)
+{
+    std::lock_guard<std::mutex> lock(http_requests_mutex_);
+    if (!m_on.load(std::memory_order_acquire)) {
+        cancel();
+        return 0;
+    }
+    const uint64_t token = ++next_http_request_token_;
+    active_http_requests_.emplace(token, std::move(cancel));
+    return token;
+}
+
+void ValidationAPI::UnregisterHttpCancellation(uint64_t token)
+{
+    std::lock_guard<std::mutex> lock(http_requests_mutex_);
+    active_http_requests_.erase(token);
+}
+
+void ValidationAPI::CancelHttpRequests()
+{
+    std::lock_guard<std::mutex> lock(http_requests_mutex_);
+    for (const auto& [token, cancel] : active_http_requests_) {
+        (void)token;
+        try {
+            cancel();
+        } catch (const std::exception& e) {
+            LogWarning("VALIDATOR: failed to cancel an in-flight HTTP request: %s\n", e.what());
+        }
+    }
+}
+
 ValidationResponseValue ValidationAPI::RunLocalQuick(const CBlock& block)
 {
     QuickVerifier verifier;
@@ -934,8 +981,15 @@ bool ValidationAPI::TryFetchPublicStatusSync(const uint256& req_id, const Valida
 
             if (endpoint->scheme == "http") {
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::tcp_stream stream{ioc};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    stream.socket().cancel(ec);
+                    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                    stream.socket().close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
 
@@ -954,8 +1008,16 @@ bool ValidationAPI::TryFetchPublicStatusSync(const uint256& req_id, const Valida
                 net::ssl::context ctx{net::ssl::context::tls_client};
                 ctx.set_default_verify_paths();
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::ssl_stream<boost::beast::tcp_stream> stream{ioc, ctx};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    auto& socket = boost::beast::get_lowest_layer(stream).socket();
+                    socket.cancel(ec);
+                    socket.shutdown(tcp::socket::shutdown_both, ec);
+                    socket.close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 if (!SSL_set_tlsext_host_name(stream.native_handle(), endpoint->host.c_str())) {
                     continue;
                 }
@@ -1091,8 +1153,15 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
 
             if (endpoint->scheme == "http") {
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::tcp_stream stream{ioc};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    stream.socket().cancel(ec);
+                    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                    stream.socket().close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
 
@@ -1115,8 +1184,16 @@ bool ValidationAPI::TryFetchAuthStatusSync(const uint256& req_id, const Validati
                 net::ssl::context ctx{net::ssl::context::tls_client};
                 ctx.set_default_verify_paths();
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::ssl_stream<boost::beast::tcp_stream> stream{ioc, ctx};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    auto& socket = boost::beast::get_lowest_layer(stream).socket();
+                    socket.cancel(ec);
+                    socket.shutdown(tcp::socket::shutdown_both, ec);
+                    socket.close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 if (!SSL_set_tlsext_host_name(stream.native_handle(), endpoint->host.c_str())) {
                     continue;
                 }
@@ -1317,8 +1394,15 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
 
             if (endpoint->scheme == "http") {
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::tcp_stream stream{ioc};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    stream.socket().cancel(ec);
+                    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                    stream.socket().close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
 
@@ -1344,8 +1428,16 @@ uint16_t ValidationAPI::SendHttpRequest(const uint256& req_id,
                 net::ssl::context ctx{net::ssl::context::tls_client};
                 ctx.set_default_verify_paths();
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::ssl_stream<boost::beast::tcp_stream> stream{ioc, ctx};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    auto& socket = boost::beast::get_lowest_layer(stream).socket();
+                    socket.cancel(ec);
+                    socket.shutdown(tcp::socket::shutdown_both, ec);
+                    socket.close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 if (!SSL_set_tlsext_host_name(stream.native_handle(), endpoint->host.c_str())) {
                     boost::system::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
                     LogError("VALIDATOR HTTP SSL error for %s: %s\n", endpoint_cfg.base_url.c_str(), ec.message());
@@ -1796,8 +1888,15 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                 net::io_context ioc;
                 if (endpoint->scheme == "http") {
                     tcp::resolver resolver{ioc};
-                    auto const results = resolver.resolve(endpoint->host, endpoint->port);
                     boost::beast::tcp_stream stream{ioc};
+                    HttpRequestGuard request_guard{*this, [&] {
+                        boost::system::error_code ec;
+                        resolver.cancel();
+                        stream.socket().cancel(ec);
+                        stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                        stream.socket().close(ec);
+                    }};
+                    auto const results = resolver.resolve(endpoint->host, endpoint->port);
                     stream.expires_after(http_config_.timeout);
                     stream.connect(results);
 
@@ -1822,8 +1921,16 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
                     net::ssl::context ctx{net::ssl::context::tls_client};
                     ctx.set_default_verify_paths();
                     tcp::resolver resolver{ioc};
-                    auto const results = resolver.resolve(endpoint->host, endpoint->port);
                     boost::beast::ssl_stream<boost::beast::tcp_stream> stream{ioc, ctx};
+                    HttpRequestGuard request_guard{*this, [&] {
+                        boost::system::error_code ec;
+                        resolver.cancel();
+                        auto& socket = boost::beast::get_lowest_layer(stream).socket();
+                        socket.cancel(ec);
+                        socket.shutdown(tcp::socket::shutdown_both, ec);
+                        socket.close(ec);
+                    }};
+                    auto const results = resolver.resolve(endpoint->host, endpoint->port);
                     if (!SSL_set_tlsext_host_name(stream.native_handle(), endpoint->host.c_str())) {
                         outcome = PublicOutcome::transport_error;
                         continue;
@@ -2106,8 +2213,15 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             net::io_context ioc;
             if (endpoint->scheme == "http") {
                 tcp::resolver resolver{ioc};
-                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 boost::beast::tcp_stream stream{ioc};
+                HttpRequestGuard request_guard{*this, [&] {
+                    boost::system::error_code ec;
+                    resolver.cancel();
+                    stream.socket().cancel(ec);
+                    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+                    stream.socket().close(ec);
+                }};
+                auto const results = resolver.resolve(endpoint->host, endpoint->port);
                 stream.expires_after(http_config_.timeout);
                 stream.connect(results);
 
@@ -2148,8 +2262,16 @@ ValidationResponseBehavior ValidationAPI::GettHttpStatus(uint256& req_id, Valida
             net::ssl::context ctx{net::ssl::context::tls_client};
             ctx.set_default_verify_paths();
             tcp::resolver resolver{ioc};
-            auto const results = resolver.resolve(endpoint->host, endpoint->port);
             boost::beast::ssl_stream<boost::beast::tcp_stream> stream{ioc, ctx};
+            HttpRequestGuard request_guard{*this, [&] {
+                boost::system::error_code ec;
+                resolver.cancel();
+                auto& socket = boost::beast::get_lowest_layer(stream).socket();
+                socket.cancel(ec);
+                socket.shutdown(tcp::socket::shutdown_both, ec);
+                socket.close(ec);
+            }};
+            auto const results = resolver.resolve(endpoint->host, endpoint->port);
             if (!SSL_set_tlsext_host_name(stream.native_handle(), endpoint->host.c_str())) {
                 boost::system::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
                 LogError("VALIDATOR HTTP SSL error for %s: %s\n", endpoint_cfg.base_url.c_str(), ec.message());
@@ -3691,6 +3813,7 @@ void ValidationAPI::StopThreads() {
     }
 
     m_on.store(false);
+    CancelHttpRequests();
     behcv.notify_all();  // wake BehaviorLoop now instead of waiting out its timeout
 
     // Interrupt the blocking receive
