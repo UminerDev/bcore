@@ -17,11 +17,17 @@ The source and peers are deliberately disconnected. This keeps ownership
 unambiguous and exercises the real ProcessNewBlock peer path.
 """
 
-from test_framework.messages import CBlock, from_hex, msg_block
+import os
+import struct
+from io import BytesIO
+from pathlib import Path
+from threading import Thread
+
+from test_framework.messages import CBlock, CProofBlob, from_hex, msg_block
 from test_framework.p2p import P2PInterface
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal, assert_raises_rpc_error
-from test_framework.vdf_helper import HAS_CHIAVDF
+from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_proxy
+from test_framework.vdf_helper import HAS_CHIAVDF, compute_pow_commitment
 
 try:
     import flatbuffers  # noqa: F401
@@ -37,7 +43,7 @@ P2_OP_TRUE_HEX = "51"
 
 class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 3
+        self.num_nodes = 4
         self.setup_clean_chain = True
         common = [
             "-validationapi=mock",
@@ -48,6 +54,7 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         self.extra_args = [
             common + ["-mockval-default-full=full_green"],
             common + ["-miningbuildaheadpeers=0"],
+            common + ["-miningbuildaheadpeers=1"],
             common + ["-miningbuildaheadpeers=1"],
         ]
         self.supports_cli = False
@@ -60,6 +67,65 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
     @staticmethod
     def _advertised_parent(node):
         return node.getmininginfo().get("build_ahead_parent_hash")
+
+    @staticmethod
+    def _full_requests(node):
+        return {
+            request["id"]
+            for request in node.validationmockrequests()
+            if request["type"] == "Full"
+        }
+
+    @staticmethod
+    def _solved_block(node, req_id, solution, model_id, parent_cumulative_tick):
+        journal = (
+            Path(node.datadir_path)
+            / REGTEST_NETWORK
+            / "broker-work-units"
+            / ("%d.dat" % req_id)
+        )
+        raw = journal.read_bytes()
+        version, stored_id = struct.unpack("<II", raw[:8])
+        assert_equal(version, 1)
+        assert_equal(stored_id, req_id)
+
+        block = CBlock()
+        block.deserialize(BytesIO(raw[8:-32]))
+
+        proof = CProofBlob()
+        proof.version = 1
+        proof.tick = solution["tick"]
+        proof.timestamp = 1700000000
+        proof.target = solution["target"]
+        proof.vdf = solution["vdf"]
+        proof.hash = solution["final_hash"]
+        proof.block_hash = solution["header_prefix"][4:36]
+        proof.header_prefix = solution["header_prefix"]
+        proof.is_solution = True
+        proof.model_identifier = model_id.encode()
+        proof.compute_precision = b"fp16"
+        proof.temperature = 1.0
+        proof.top_p = 1.0
+        proof.top_k = 8
+        proof.repetition_penalty = 1.0
+        proof.chosen_tokens = solution["chosen_tokens"]
+        proof.sampling_u = solution["sampling_u"]
+        fillers = [0x80000000 + index for index in range(7)]
+        proof.topk_logits = [[50.0] + [0.0] * 7 for _ in proof.chosen_tokens]
+        proof.topk_indices = [
+            [token] + fillers for token in proof.chosen_tokens
+        ]
+
+        block.nNonce = solution["nonce"]
+        block.nAdjBits = solution["adjusted_bits"]
+        block.pow = proof
+        block.cumulative_tick = parent_cumulative_tick + proof.tick
+        block.hashPoW = int.from_bytes(
+            compute_pow_commitment(proof, use_merkle=True),
+            "little",
+        )
+        block.rehash()
+        return block
 
     def run_test(self):
         if not (HAS_FLATBUFFERS and HAS_CHIAVDF):
@@ -78,11 +144,17 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
             build_mining_response,
             solve_work_unit,
         )
+        os.environ["TSC_VDF_TEST_HELPER"] = str(
+            Path(self.config["environment"]["BUILDDIR"])
+            / "bin"
+            / "vdf_test_helper"
+        )
 
-        source, default_peer, enabled_peer = self.nodes
+        source, default_peer, enabled_peer, submit_peer = self.nodes
         genesis = source.getbestblockhash()
         assert_equal(default_peer.getbestblockhash(), genesis)
         assert_equal(enabled_peer.getbestblockhash(), genesis)
+        assert_equal(submit_peer.getbestblockhash(), genesis)
 
         registered = [
             model
@@ -112,13 +184,17 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         self.log.info("Deliver A as a peer block to both isolated broker nodes")
         default_link = default_peer.add_p2p_connection(P2PInterface())
         enabled_link = enabled_peer.add_p2p_connection(P2PInterface())
+        submit_link = submit_peer.add_p2p_connection(P2PInterface())
         default_link.send_and_ping(msg_block(block_a))
         enabled_link.send_and_ping(msg_block(block_a))
+        submit_link.send_and_ping(msg_block(block_a))
 
         assert_equal(default_peer.getbestblockhash(), genesis)
         assert_equal(enabled_peer.getbestblockhash(), genesis)
+        assert_equal(submit_peer.getbestblockhash(), genesis)
         assert self._advertised_parent(default_peer) is None
         assert_equal(self._advertised_parent(enabled_peer), a_hash)
+        assert_equal(self._advertised_parent(submit_peer), a_hash)
 
         self.log.info("Opt-in node can mint a coinbase-only child of peer block A")
         child = enabled_peer.create_mining_work_unit(
@@ -126,6 +202,70 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         )
         assert_equal(child["tip_hash"], a_hash)
         assert_equal(child["height"], 2)
+
+        self.log.info("A child submitted before peer parent Full completes is retained")
+        submit_child = submit_peer.create_mining_work_unit(
+            REGTEST_NETWORK, P2_OP_TRUE_HEX, "", a_hash
+        )
+        solution = solve_work_unit(
+            submit_child["header_prefix"], submit_child["target"]
+        )
+        payload = build_mining_response(
+            submit_child["req_id"], solution, model_identifier=model_id
+        )
+        submit_rpc = get_rpc_proxy(
+            submit_peer.url,
+            100,
+            timeout=120,
+            coveragedir=submit_peer.coverage_dir,
+        )
+        child_result = {}
+        child_error = []
+
+        def submit_pending_child():
+            try:
+                child_result.update(
+                    submit_rpc.submit_mining_response(
+                        submit_child["req_id"], payload
+                    )
+                )
+            except Exception as error:
+                child_error.append(error)
+
+        submit_thread = Thread(target=submit_pending_child)
+        submit_thread.start()
+        self.wait_until(
+            lambda: len(self._full_requests(submit_peer) - {a_hash}) == 1,
+            timeout=20,
+        )
+        child_hash = next(iter(self._full_requests(submit_peer) - {a_hash}))
+        assert submit_thread.is_alive()
+        assert_equal(submit_peer.getbestblockhash(), genesis)
+
+        submit_peer.validationmockset(child_hash, "full", "full_green")
+        solved_child = self._solved_block(
+            submit_peer,
+            submit_child["req_id"],
+            solution,
+            model_id,
+            block_a.cumulative_tick,
+        )
+        assert_equal(solved_child.hash, child_hash)
+        # validationmockset only records a verdict. Resend the exact solved
+        # block to model the real verifier's ProcessNewBlock callback.
+        submit_link.send_and_ping(msg_block(solved_child))
+        assert_equal(submit_peer.getbestblockhash(), genesis)
+        submit_peer.validationmockset(a_hash, "full", "full_green")
+        submit_link.send_and_ping(msg_block(block_a))
+        self.wait_until(
+            lambda: submit_peer.getbestblockhash() == child_hash,
+            timeout=30,
+        )
+        submit_thread.join(timeout=30)
+        assert not submit_thread.is_alive()
+        assert not child_error, child_error
+        assert_equal(child_result["accepted"], True)
+        assert_equal(child_result["status"], "accepted")
 
         self.log.info("Full Amber and Red each fail closed")
         for full_status in ("full_amber", "full_red"):
