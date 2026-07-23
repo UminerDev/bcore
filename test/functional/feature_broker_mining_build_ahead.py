@@ -23,7 +23,7 @@ pending block by toggling its mock smell/Full status:
   * Quick_OK_Smell_Fail  -> not advertised, child mint fails closed;
   * own Full_Red         -> not advertised, child mint fails closed;
   * a bogus parent hash  -> child mint fails closed;
-  * restoring smell_ok / full_amber re-advertises A.
+  * Full Amber and Full Red both fail closed.
 
 Requires the same optional deps as feature_broker_mining_rpc.py (flatbuffers +
 chiavdf) to build a real proof::MiningResponse that passes QuickVerify.

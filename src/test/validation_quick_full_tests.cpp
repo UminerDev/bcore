@@ -4,6 +4,7 @@
 
 #include <arith_uint256.h>
 #include <chainparams.h>
+#include <common/args.h>
 #include <node/blockstorage.h>
 #include <node/miner.h>
 #include <pow.h>
@@ -85,6 +86,47 @@ BOOST_AUTO_TEST_CASE(delayed_quick_ok_smell_ok_triggers_early_propagation)
                      .has_value());
 
     m_node.validation_signals->UnregisterValidationInterface(&catcher);
+}
+
+BOOST_AUTO_TEST_CASE(peer_pending_build_ahead_requires_explicit_opt_in)
+{
+    CBlock block = CreateTensorBlock(m_node);
+    auto blockptr = std::make_shared<const CBlock>(block);
+    bool new_block{false};
+
+    gArgs.ForceSetArg("-miningbuildaheadpeers", "0");
+    BOOST_CHECK(!Assert(m_node.chainman)->ProcessNewBlock(
+        blockptr,
+        /*force_processing=*/true,
+        /*min_pow_checked=*/true,
+        &new_block));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(node::SelectBuildAheadParent(*Assert(m_node.chainman)) == nullptr);
+    }
+
+    gArgs.ForceSetArg("-miningbuildaheadpeers", "1");
+    {
+        LOCK(cs_main);
+        const CBlockIndex* selected{
+            node::SelectBuildAheadParent(*Assert(m_node.chainman))};
+        BOOST_REQUIRE(selected != nullptr);
+        BOOST_CHECK_EQUAL(selected->GetBlockHash(), block.GetHash());
+        BOOST_CHECK_EQUAL(selected->pprev, Assert(m_node.chainman)->ActiveTip());
+    }
+
+    BOOST_REQUIRE(g_ValidationApi->SetRequestStatus(
+        block.GetHash(),
+        ValidationReqType::Full,
+        ValidationResponseValue::Full_Amber));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(node::SelectBuildAheadParent(*Assert(m_node.chainman)) == nullptr);
+    }
+    BOOST_REQUIRE(g_ValidationApi->RemoveRes_Full(block.GetHash()));
+
+    // Tests share the global ArgsManager; restore the production-safe default.
+    gArgs.ForceSetArg("-miningbuildaheadpeers", "0");
 }
 
 BOOST_AUTO_TEST_CASE(delayed_quick_smell_failure_does_not_propagate)

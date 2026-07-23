@@ -46,6 +46,7 @@
 #include <logging/timer.h>
 #include <modeldb.h>
 #include <node/blockstorage.h>
+#include <node/miner.h>
 #include <node/utxo_snapshot.h>
 #include <policy/ephemeral_policy.h>
 #include <policy/policy.h>
@@ -9408,6 +9409,10 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
                         if (g_ValidationApi->GetRequestStatus(block->GetHash(), ValidationReqType::Quick_Smell, status) &&
                                 status == ValidationResponseValue::Quick_OK_Smell_OK)
                         {
+                            node::RecordPendingBuildAheadBlock(
+                                *this,
+                                *block,
+                                /*owned=*/false);
                             EarlyPropagation(block);
                         }
                         g_ValidationApi->EnqueueApiRequest(*block, ValidationReqType::Full, ValidationResponseBehavior::ProcessNewBlock);

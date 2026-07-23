@@ -33,6 +33,8 @@
 #include <txmempool.h>
 
 #include <algorithm>
+#include <limits>
+#include <map>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
@@ -42,7 +44,204 @@ namespace node {
 namespace {
 std::mutex g_model_override_mutex;
 std::optional<std::string> g_model_override;
+
+struct PendingBuildAheadBlock {
+    int height{0};
+    uint256 prev_hash;
+    uint64_t cumulative_tick{0};
+    bool owned{false};
+};
+
+Mutex g_pending_build_ahead_mutex;
+std::map<uint256, PendingBuildAheadBlock> g_pending_build_ahead
+    GUARDED_BY(g_pending_build_ahead_mutex);
 } // namespace
+
+std::optional<uint64_t> GetBuildAheadParentCumulativeTick(
+    ChainstateManager& chainman,
+    const uint256& prev_hash)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const CBlockIndex* pprev = chainman.m_blockman.LookupBlockIndex(prev_hash);
+    if (pprev != nullptr && (pprev->nStatus & BLOCK_HAVE_DATA)) {
+        CBlock previous;
+        if (chainman.m_blockman.ReadBlock(previous, *pprev)) {
+            return previous.cumulative_tick;
+        }
+    }
+    LOCK(g_pending_build_ahead_mutex);
+    const auto it = g_pending_build_ahead.find(prev_hash);
+    if (it != g_pending_build_ahead.end()) {
+        return it->second.cumulative_tick;
+    }
+    return std::nullopt;
+}
+
+bool RecordPendingBuildAheadBlock(
+    ChainstateManager& chainman,
+    const CBlock& block,
+    bool owned)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(block.GetHash());
+    const CBlockIndex* pprev = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+    if (pindex == nullptr || pprev == nullptr || pindex->pprev != pprev) {
+        return false;
+    }
+    const std::optional<uint64_t> parent_tick{
+        GetBuildAheadParentCumulativeTick(chainman, block.hashPrevBlock)};
+    if (!parent_tick ||
+        block.pow.tick > std::numeric_limits<uint64_t>::max() - *parent_tick) {
+        return false;
+    }
+    const uint64_t cumulative_tick{*parent_tick + block.pow.tick};
+    if (block.cumulative_tick != cumulative_tick) {
+        LogPrintLevel(
+            BCLog::VALIDATION,
+            BCLog::Level::Warning,
+            "Ignoring build-ahead candidate %s with inconsistent cumulative_tick "
+            "(body=%llu, derived=%llu)\n",
+            block.GetHash().ToString(),
+            static_cast<unsigned long long>(block.cumulative_tick),
+            static_cast<unsigned long long>(cumulative_tick));
+        return false;
+    }
+
+    LOCK(g_pending_build_ahead_mutex);
+    auto [it, inserted] = g_pending_build_ahead.try_emplace(
+        block.GetHash(),
+        PendingBuildAheadBlock{
+            pindex->nHeight,
+            block.hashPrevBlock,
+            cumulative_tick,
+            owned});
+    if (!inserted) {
+        it->second.owned = it->second.owned || owned;
+        it->second.height = pindex->nHeight;
+        it->second.prev_hash = block.hashPrevBlock;
+        it->second.cumulative_tick = cumulative_tick;
+    }
+
+    // Eligibility is always rechecked against the live active tip. Pruning is
+    // only a memory bound for stale side branches and does not decide validity.
+    if (g_pending_build_ahead.size() > 64) {
+        int highest{0};
+        for (const auto& entry : g_pending_build_ahead) {
+            highest = std::max(highest, entry.second.height);
+        }
+        for (auto candidate = g_pending_build_ahead.begin();
+             candidate != g_pending_build_ahead.end();) {
+            if (candidate->second.height + 8 < highest) {
+                candidate = g_pending_build_ahead.erase(candidate);
+            } else {
+                ++candidate;
+            }
+        }
+    }
+    return true;
+}
+
+bool IsOwnedPendingBuildAheadInFlight(
+    ChainstateManager& chainman,
+    const uint256& hash)
+{
+    {
+        LOCK(g_pending_build_ahead_mutex);
+        const auto it = g_pending_build_ahead.find(hash);
+        if (it == g_pending_build_ahead.end() || !it->second.owned) {
+            return false;
+        }
+    }
+    if (g_ValidationApi != nullptr) {
+        const uint8_t own_full = g_ValidationApi->GetOwnFullStatus(hash);
+        if (own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Red) ||
+            own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Amber)) {
+            return false;
+        }
+    }
+    LOCK(::cs_main);
+    const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hash);
+    if (pindex == nullptr) {
+        return true;
+    }
+    return !(pindex->nStatus & BLOCK_FAILED_MASK) &&
+           !chainman.ActiveChain().Contains(pindex);
+}
+
+namespace {
+bool IsBuildAheadEligible(ChainstateManager& chainman, const uint256& hash)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    bool owned{false};
+    {
+        LOCK(g_pending_build_ahead_mutex);
+        const auto it = g_pending_build_ahead.find(hash);
+        if (it == g_pending_build_ahead.end()) {
+            return false;
+        }
+        owned = it->second.owned;
+    }
+    if (!owned && !gArgs.GetBoolArg("-miningbuildaheadpeers", false)) {
+        return false;
+    }
+
+    const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hash);
+    if (pindex == nullptr || pindex->pprev == nullptr ||
+        pindex->pprev != chainman.ActiveChain().Tip() ||
+        (pindex->nStatus & BLOCK_FAILED_MASK) || g_ValidationApi == nullptr) {
+        return false;
+    }
+
+    const uint8_t own_full = g_ValidationApi->GetOwnFullStatus(hash);
+    if (own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Red) ||
+        own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Amber)) {
+        return false;
+    }
+    ValidationResponseValue quick_status;
+    return g_ValidationApi->GetRequestStatus(
+               hash,
+               ValidationReqType::Quick_Smell,
+               quick_status) &&
+           quick_status == ValidationResponseValue::Quick_OK_Smell_OK;
+}
+} // namespace
+
+const CBlockIndex* SelectBuildAheadParent(ChainstateManager& chainman)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    std::vector<uint256> candidates;
+    {
+        LOCK(g_pending_build_ahead_mutex);
+        candidates.reserve(g_pending_build_ahead.size());
+        for (const auto& entry : g_pending_build_ahead) {
+            candidates.push_back(entry.first);
+        }
+    }
+
+    const CBlockIndex* best{nullptr};
+    uint64_t best_tick{0};
+    for (const uint256& hash : candidates) {
+        if (!IsBuildAheadEligible(chainman, hash)) {
+            continue;
+        }
+        uint64_t candidate_tick{0};
+        {
+            LOCK(g_pending_build_ahead_mutex);
+            const auto it = g_pending_build_ahead.find(hash);
+            if (it != g_pending_build_ahead.end()) {
+                candidate_tick = it->second.cumulative_tick;
+            }
+        }
+        const CBlockIndex* pindex = chainman.m_blockman.LookupBlockIndex(hash);
+        if (best == nullptr || candidate_tick > best_tick ||
+            (candidate_tick == best_tick && hash < best->GetBlockHash())) {
+            best = pindex;
+            best_tick = candidate_tick;
+        }
+    }
+    return best;
+}
 
 std::optional<std::string> GetMiningModelOverride()
 {
@@ -199,19 +398,20 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
             throw std::runtime_error(strprintf("%s: build-ahead parent %s is failed",
                                                __func__, m_options.prev_block_hash->ToString()));
         }
-        // Exclude only our OWN Full_Red verdict (this node computed the block is
-        // zero-work / penalised — NOT a BLOCK_FAILED, so the mask check above
-        // does not cover it). GetOwnFullStatus() == getFull(own=true) returns the
-        // raw own status, so an in-progress (Not_Checked/Amber) parent — the
-        // normal build-ahead state — is NOT excluded. The aggregate
-        // GetRequestStatus(Full) calls getFull(own=false), which maps
-        // own-Amber-with-no-peer-reports to Full_Red and would wrongly exclude A
-        // during its own validation window (validationapi.cpp:135).
-        if (g_ValidationApi != nullptr &&
-            g_ValidationApi->GetOwnFullStatus(*m_options.prev_block_hash) ==
-                static_cast<uint8_t>(ValidationResponseValue::Full_Red)) {
-            throw std::runtime_error(strprintf("%s: build-ahead parent %s is Full_Red (own verdict)",
-                                               __func__, m_options.prev_block_hash->ToString()));
+        // Recheck the local Full verdict under the same cs_main critical section
+        // as template assembly. The selector excludes Red and Amber, but the
+        // verdict can change between getmininginfo and this call.
+        if (g_ValidationApi != nullptr) {
+            const uint8_t own_full{
+                g_ValidationApi->GetOwnFullStatus(*m_options.prev_block_hash)};
+            if (own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Red) ||
+                own_full == static_cast<uint8_t>(ValidationResponseValue::Full_Amber)) {
+                throw std::runtime_error(strprintf(
+                    "%s: build-ahead parent %s has non-eligible Full status %u",
+                    __func__,
+                    m_options.prev_block_hash->ToString(),
+                    own_full));
+            }
         }
     } else {
         pindexPrev = m_chainstate.m_chain.Tip();

@@ -5,6 +5,7 @@
 #include <primitives/block.h>
 #include <primitives/proofblob.h>
 #include <modeldb.h>
+#include <node/miner.h>
 #include <rpc/validation_generated.h>
 #include <rpc/server_util.h>
 #include <thread>
@@ -2791,9 +2792,19 @@ bool ValidationAPI::HandleQuickSmellResult(
         } else {
             const auto shared_block{std::make_shared<const CBlock>(std::move(*block))};
             LOCK(cs_main);
+            const bool build_ahead_recorded{
+                node::RecordPendingBuildAheadBlock(
+                    m_chainman,
+                    *shared_block,
+                    /*owned=*/false)};
             propagated = m_chainman.EarlyPropagation(shared_block);
-            LogPrintf("%s: delayed Quick/Smell result for %s, early_propagated=%d\n",
-                      __func__, id.ToString(), propagated);
+            LogPrintf(
+                "%s: delayed Quick/Smell result for %s, early_propagated=%d, "
+                "build_ahead_recorded=%d\n",
+                __func__,
+                id.ToString(),
+                propagated,
+                build_ahead_recorded);
         }
     }
 

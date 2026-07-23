@@ -43,6 +43,28 @@ class KernelNotifications;
 
 static const bool DEFAULT_PRINT_MODIFIED_FEE = false;
 
+/**
+ * Track a Quick/Smell-approved block whose Full verdict is still pending so
+ * broker mining can speculatively assemble its child. The caller must hold
+ * cs_main; the recorded cumulative tick is derived from the known parent
+ * rather than trusted from the incoming block body.
+ */
+bool RecordPendingBuildAheadBlock(ChainstateManager& chainman, const CBlock& block, bool owned);
+
+/** True only for a locally submitted block still waiting for a terminal verdict. */
+bool IsOwnedPendingBuildAheadInFlight(ChainstateManager& chainman, const uint256& hash);
+
+/** Read cumulative tick from disk or from the bounded pending-parent registry. */
+std::optional<uint64_t> GetBuildAheadParentCumulativeTick(
+    ChainstateManager& chainman,
+    const uint256& prev_hash);
+
+/**
+ * Select the best Quick/Smell-approved parent exactly one block above the
+ * active tip. Peer-originated parents require -miningbuildaheadpeers=1.
+ */
+const CBlockIndex* SelectBuildAheadParent(ChainstateManager& chainman);
+
 struct CBlockTemplate
 {
     CBlock block;
