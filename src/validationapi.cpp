@@ -2732,8 +2732,17 @@ void ValidationAPI::SolutionReceiverLoop() {
             continue;
         }
 
-        // For synchronous paths (behavior == Nothing) or non-Full validations
-        // we just finish and remove the tracked request.
+        // Quick/Smell commonly arrives after ProcessNewBlock has already
+        // admitted the header and queued Full validation. Preserve the
+        // submit-first path: a successful delayed result only announces the
+        // already tracked block and never re-runs block processing.
+        if (type == ValidationReqType::Quick_Smell) {
+            HandleQuickSmellResult(id, status);
+            continue;
+        }
+
+        // For synchronous paths or other non-Full validations we just finish
+        // and remove the tracked request.
         if (behavior == ValidationResponseBehavior::Nothing || type != ValidationReqType::Full) {
             requestTracker.finishRequest(id, type);
             continue;
@@ -2763,6 +2772,36 @@ void ValidationAPI::SolutionReceiverLoop() {
         requestTracker.finishRequest(id, type);
     }
     LogPrintf("VALIDATOR: SolutionReceiverLoop thread was finished\n");
+}
+
+bool ValidationAPI::HandleQuickSmellResult(
+    const uint256& id,
+    ValidationResponseValue status)
+{
+    bool propagated{false};
+    if (status == ValidationResponseValue::Quick_OK_Smell_OK) {
+        std::optional<CBlock> block;
+        {
+            std::shared_lock lock(requestTracker.mutex_);
+            block = requestTracker.getBlockForId(id, ValidationReqType::Quick_Smell);
+        }
+        if (!block.has_value()) {
+            LogError("%s: no block found for delayed Quick/Smell result: %s\n",
+                     __func__, id.ToString());
+        } else {
+            const auto shared_block{std::make_shared<const CBlock>(std::move(*block))};
+            LOCK(cs_main);
+            propagated = m_chainman.EarlyPropagation(shared_block);
+            LogPrintf("%s: delayed Quick/Smell result for %s, early_propagated=%d\n",
+                      __func__, id.ToString(), propagated);
+        }
+    }
+
+    // Keep the tracked block alive until after a successful result has had
+    // its one opportunity to announce. finishRequest is idempotent for
+    // duplicate receiver notifications.
+    requestTracker.finishRequest(id, ValidationReqType::Quick_Smell);
+    return propagated;
 }
 
 void ValidationAPI::BehaviorLoop() {

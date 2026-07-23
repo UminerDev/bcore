@@ -532,6 +532,8 @@ private:
     void JobSchedulerLoop();
     void SolutionReceiverLoop();
     void BehaviorLoop();
+    bool HandleQuickSmellResult(const uint256& id,
+                                ValidationResponseValue status);
     void checkNetworkHealth();
     void StartAmberFlow(const uint256& id, const CBlock& block, ValidationResponseBehavior behavior, ValidationResponseValue initial_status = ValidationResponseValue::Full_Amber);
     void ProcessAmberRequests();

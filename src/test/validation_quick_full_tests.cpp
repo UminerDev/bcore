@@ -9,8 +9,13 @@
 #include <pow.h>
 #include <primitives/block.h>
 #include <test/util/mining.h>
-#include <test/util/mock_validation_api.h>
 #include <test/util/setup_common.h>
+
+#define private public
+#include <validationapi.h>
+#undef private
+
+#include <test/util/mock_validation_api.h>
 #include <test/util/validation.h>
 #include <validationinterface.h>
 #include <validation.h>
@@ -54,6 +59,54 @@ BOOST_AUTO_TEST_CASE(quick_ok_smell_ok_triggers_early_propagation)
     // No Full status preset: should enqueue Full, not accept, but early propagate
     BOOST_CHECK(!Assert(m_node.chainman)->ProcessNewBlock(blockptr, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
     BOOST_CHECK_EQUAL(catcher.count, 1);
+
+    m_node.validation_signals->UnregisterValidationInterface(&catcher);
+}
+
+BOOST_AUTO_TEST_CASE(delayed_quick_ok_smell_ok_triggers_early_propagation)
+{
+    PropagationCatcher catcher;
+    m_node.validation_signals->RegisterValidationInterface(&catcher);
+
+    CBlock block = CreateTensorBlock(m_node);
+    ValidationAPI api{*Assert(m_node.chainman), Params().GetConsensus()};
+    uint256 request_id;
+    BOOST_REQUIRE(api.requestTracker.makeNewRequest(
+        block,
+        ValidationReqType::Quick_Smell,
+        request_id,
+        ValidationResponseBehavior::Nothing));
+
+    BOOST_CHECK(api.HandleQuickSmellResult(
+        request_id, ValidationResponseValue::Quick_OK_Smell_OK));
+    BOOST_CHECK_EQUAL(catcher.count, 1);
+    BOOST_CHECK(!api.requestTracker
+                     .getBlockForId(request_id, ValidationReqType::Quick_Smell)
+                     .has_value());
+
+    m_node.validation_signals->UnregisterValidationInterface(&catcher);
+}
+
+BOOST_AUTO_TEST_CASE(delayed_quick_smell_failure_does_not_propagate)
+{
+    PropagationCatcher catcher;
+    m_node.validation_signals->RegisterValidationInterface(&catcher);
+
+    CBlock block = CreateTensorBlock(m_node);
+    ValidationAPI api{*Assert(m_node.chainman), Params().GetConsensus()};
+    uint256 request_id;
+    BOOST_REQUIRE(api.requestTracker.makeNewRequest(
+        block,
+        ValidationReqType::Quick_Smell,
+        request_id,
+        ValidationResponseBehavior::Nothing));
+
+    BOOST_CHECK(!api.HandleQuickSmellResult(
+        request_id, ValidationResponseValue::Quick_OK_Smell_Fail));
+    BOOST_CHECK_EQUAL(catcher.count, 0);
+    BOOST_CHECK(!api.requestTracker
+                     .getBlockForId(request_id, ValidationReqType::Quick_Smell)
+                     .has_value());
 
     m_node.validation_signals->UnregisterValidationInterface(&catcher);
 }
