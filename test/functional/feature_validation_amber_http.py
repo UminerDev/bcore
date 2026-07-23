@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 AMBER_RESOLUTION_TIMEOUT = 150  # fallback ladder is 0/1/60/120s with force-finalize after the 4th attempt (~61s)
 
@@ -105,6 +105,7 @@ class ValidationAmberHttpTest(BitcoinTestFramework):
             f"-validatorhttpurl=http://127.0.0.1:{self.stub.server_address[1]}",
             "-validatorapikey=test-key",
             "-validationapi-force-external=1",
+            "-allowvalidationadjudication=1",
             # Require full validation for every block: the fresh clean-chain
             # node never counts as "live", and once the RED chainwork replay
             # zeroes the candidate it drops out of the tip window, which would
@@ -137,6 +138,13 @@ class ValidationAmberHttpTest(BitcoinTestFramework):
         # real-API node whose validator persistently answers Full_Amber.
         block_hash = self.generate(miner, 1, sync_fun=self.no_op)[0]
         block_hex = miner.getblock(block_hash, 0)
+        assert_raises_rpc_error(
+            -2,
+            "Validation adjudication is disabled",
+            miner.adjudicatefullgreen,
+            block_hash,
+            "ab" * 32,
+        )
         validated.submitblock(block_hex)
 
         self.wait_for_log(validated, f"Full validation amber for {block_hash}", timeout=60)
@@ -164,13 +172,29 @@ class ValidationAmberHttpTest(BitcoinTestFramework):
         self.wait_until(lambda: validated.getblockheader(block_hash) is not None, timeout=30)
         assert_equal(validated.getbestblockhash(), parent_hash)
         assert_equal(int(validated.getblockheader(block_hash)["chainwork"], 16), parent_work)
+        assert_raises_rpc_error(
+            -1,
+            "Block must have a previous Full_Amber verdict",
+            validated.adjudicatefullgreen,
+            block_hash,
+            "ab" * 32,
+        )
 
-        # Green path over the same HTTP transport: flip the stub and
-        # revalidate — chainwork is replayed and the block becomes best.
-        self.stub.full_status = "Full_Green"
-        result = validated.revalidateblock(block_hash, 60000)
-        assert_equal(result["validation_status"], "full_green")
+        # Re-run the private validator after the no-peer fallback stored Red.
+        # A fresh Amber remains non-terminal and is the only status eligible
+        # for operator adjudication.
+        amber_result = validated.revalidateblock(block_hash, 60000)
+        assert_equal(amber_result["validation_status"], "full_amber")
+        assert_equal(amber_result["chain_action"], "pending_amber")
+
+        # Operator adjudication is the explicit recovery path when an
+        # independent verifier has already returned Full_Green. It is gated by
+        # a startup flag and records the digest of the persisted attestation.
+        evidence_sha256 = "ab" * 32
+        result = validated.adjudicatefullgreen(block_hash, evidence_sha256)
+        assert_equal(result["previous_status"], "full_amber")
         assert_equal(result["chain_action"], "accepted")
+        assert_equal(result["evidence_sha256"], evidence_sha256)
         assert_equal(validated.getbestblockhash(), block_hash)
 
         self.stub.shutdown()

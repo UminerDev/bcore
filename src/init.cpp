@@ -765,6 +765,7 @@ void SetupServerArgs(ArgsManager& argsman, bool can_listen_ipc)
     argsman.AddArg("-validatorhttpurl=<url>", "Gateway verification service base URL for desktop/HTTP mode (e.g., https://verify.tensorcash.org, no trailing slash)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatorapikey=<key>", "API key for gateway verification service (desktop/HTTP mode)", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-validatorapikeys=<k1,k2,...>", "Comma-separated API keys for gateway verification service endpoints in desktop/HTTP mode. Either provide one shared key or one key per configured base URL.", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-allowvalidationadjudication", "Allow the local operator RPC to promote a Full_Amber block after independently verified Full_Green evidence (default: 0)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     // External miner API toggle (useful for tests)
     argsman.AddArg("-useextapi", "Enable external miner API (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     // Selects the mining-orchestration mode. There are two first-class

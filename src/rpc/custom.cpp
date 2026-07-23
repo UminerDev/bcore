@@ -800,17 +800,11 @@ static std::string ApplyValidationChainAction(ChainstateManager& chainman, CBloc
         return "zero_work_red";
     }
     case ValidationResponseValue::Full_Amber: {
-        if (!chainman.ActiveChainstate().InvalidateBlock(state, &index)) {
-            throw JSONRPCError(RPC_DATABASE_ERROR, state.ToString());
-        }
-        if (state.IsValid()) {
-            if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
-                throw JSONRPCError(RPC_DATABASE_ERROR, state.ToString());
-            }
-        } else {
-            throw JSONRPCError(RPC_DATABASE_ERROR, state.ToString());
-        }
-        return "invalidated_amber";
+        // Amber means the verifier could not reach a terminal verdict. It is
+        // not evidence that the block is invalid, so leave the chain state
+        // untouched and let corroboration or an operator adjudication resolve
+        // it later.
+        return "pending_amber";
     }
     default:
         throw JSONRPCError(RPC_MISC_ERROR, "Unexpected validation status");
@@ -830,7 +824,7 @@ static RPCHelpMan revalidateblock()
                     {
                         {RPCResult::Type::STR_HEX, "blockhash", "Validated block hash"},
                         {RPCResult::Type::STR, "validation_status", "Validation result: full_green|full_amber|full_red"},
-                        {RPCResult::Type::STR, "chain_action", "Chain handling: accepted|invalidated_amber|zero_work_red"},
+                        {RPCResult::Type::STR, "chain_action", "Chain handling: accepted|pending_amber|zero_work_red"},
                     }
                 },
                 RPCExamples{
@@ -889,6 +883,99 @@ static RPCHelpMan revalidateblock()
     };
 }
 
+static RPCHelpMan adjudicatefullgreen()
+{
+    return RPCHelpMan{"adjudicatefullgreen",
+                "\nPromote a previously Full_Amber block after an operator has verified independent Full_Green evidence.\n"
+                "This recovery RPC is disabled unless -allowvalidationadjudication=1 is set.\n",
+                {
+                    {"blockhash", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Block hash to promote"},
+                    {"evidence_sha256", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "SHA-256 of the persisted external attestation"},
+                },
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::STR_HEX, "blockhash", "Promoted block hash"},
+                        {RPCResult::Type::STR_HEX, "evidence_sha256", "Evidence digest recorded in the node log"},
+                        {RPCResult::Type::STR, "previous_status", "Previous local Full status"},
+                        {RPCResult::Type::STR, "chain_action", "Chain handling: accepted|already_green"},
+                    }
+                },
+                RPCExamples{
+                    HelpExampleCli("adjudicatefullgreen", "\"<blockhash>\" \"<evidence_sha256>\"")
+                    + HelpExampleRpc("adjudicatefullgreen", "\"<blockhash>\", \"<evidence_sha256>\"")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    if (!gArgs.GetBoolArg("-allowvalidationadjudication", false)) {
+        throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE,
+                           "Validation adjudication is disabled; start with -allowvalidationadjudication=1");
+    }
+    if (!g_ValidationApi) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Validation API not initialized");
+    }
+
+    auto maybe_hash = uint256::FromHex(request.params[0].get_str());
+    if (!maybe_hash) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid block hash");
+    }
+    const uint256 block_hash = *maybe_hash;
+    const std::string evidence_sha256 = request.params[1].get_str();
+    if (evidence_sha256.size() != 64 || !IsHex(evidence_sha256)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "evidence_sha256 must be 64 hexadecimal characters");
+    }
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    CBlockIndex* pindex{nullptr};
+    {
+        LOCK(chainman.GetMutex());
+        pindex = chainman.m_blockman.LookupBlockIndex(block_hash);
+        if (!pindex) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
+        }
+    }
+
+    CBlock block;
+    if (!chainman.m_blockman.ReadBlock(block, *pindex)) {
+        throw JSONRPCError(RPC_MISC_ERROR, "Failed to read block from disk");
+    }
+
+    const ValidationResponseValue previous =
+        static_cast<ValidationResponseValue>(g_ValidationApi->GetOwnFullStatus(block_hash));
+    if (previous == ValidationResponseValue::Full_Green) {
+        UniValue result(UniValue::VOBJ);
+        result.pushKV("blockhash", block_hash.ToString());
+        result.pushKV("evidence_sha256", evidence_sha256);
+        result.pushKV("previous_status", FullValidationStatusToString(previous));
+        result.pushKV("chain_action", "already_green");
+        return result;
+    }
+    if (previous != ValidationResponseValue::Full_Amber) {
+        throw JSONRPCError(RPC_MISC_ERROR,
+                           "Block must have a previous Full_Amber verdict");
+    }
+
+    if (!g_ValidationApi->SetRequestStatus(block_hash, ValidationReqType::Full,
+                                           ValidationResponseValue::Full_Green)) {
+        throw JSONRPCError(RPC_DATABASE_ERROR, "Failed to persist adjudicated Full_Green status");
+    }
+    const std::string chain_action =
+        ApplyValidationChainAction(chainman, *pindex, ValidationResponseValue::Full_Green);
+
+    LogPrintf("Operator Full_Green adjudication block=%s previous=%s evidence_sha256=%s action=%s\n",
+              block_hash.ToString(), FullValidationStatusToString(previous),
+              evidence_sha256, chain_action);
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("blockhash", block_hash.ToString());
+    result.pushKV("evidence_sha256", evidence_sha256);
+    result.pushKV("previous_status", FullValidationStatusToString(previous));
+    result.pushKV("chain_action", chain_action);
+    return result;
+},
+    };
+}
+
 
 void RegisterCustomRPCCommands(CRPCTable& t)
 {
@@ -905,6 +992,7 @@ void RegisterCustomRPCCommands(CRPCTable& t)
         {"custom", &getvalidationqueues},
         {"custom", &getvalidationapiinfo},
         {"custom", &revalidateblock},
+        {"custom", &adjudicatefullgreen},
         {"custom", &getrecentvalidations},
         // Mock validation API controls (only active when -validationapi=mock)
         {"mock", &validationmockset},
