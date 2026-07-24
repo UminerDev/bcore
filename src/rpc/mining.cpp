@@ -71,6 +71,7 @@ using interfaces::BlockRef;
 using interfaces::BlockTemplate;
 using interfaces::Mining;
 using node::BlockAssembler;
+using node::CheckedCumulativeTick;
 using node::GetBuildAheadParentCumulativeTick;
 using node::GetMinimumTime;
 using node::IsOwnedPendingBuildAheadInFlight;
@@ -1686,9 +1687,20 @@ static RPCHelpMan create_mining_work_unit()
     // (The active-tip path already has the correct value from CreateNewBlock.)
     if (build_ahead_parent) {
         LOCK(cs_main);
-        if (auto parent_ct = GetBuildAheadParentCumulativeTick(chainman, block.hashPrevBlock)) {
-            block.cumulative_tick = *parent_ct + block.pow.tick;
+        const auto parent_tick{
+            GetBuildAheadParentCumulativeTick(chainman, block.hashPrevBlock)};
+        if (!parent_tick) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "build-ahead parent cumulative tick is unavailable");
         }
+        const auto cumulative_tick{CheckedCumulativeTick(*parent_tick, block.pow.tick)};
+        if (!cumulative_tick) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "build-ahead cumulative tick overflow");
+        }
+        block.cumulative_tick = *cumulative_tick;
     }
 
     // Apply -maxminingworkunits on first mint. g_broker_work_units is
@@ -1765,7 +1777,7 @@ static RPCHelpMan submit_mining_response()
         RPCResult{RPCResult::Type::OBJ, "", "",
         {
             {RPCResult::Type::BOOL, "accepted", "true ONLY when the block is active on the main chain with data; false while Full validation is still in flight or on reject"},
-            {RPCResult::Type::STR, "status", "one of: accepted | accepted_pending_connect | rejected | unknown_req_id | already_submitted | invalid_payload | quick_verify_failed"},
+            {RPCResult::Type::STR, "status", "one of: accepted | accepted_pending_connect | rejected | unknown_req_id | already_submitted | invalid_payload | quick_verify_failed | parent_state_unavailable"},
             {RPCResult::Type::STR, "block_hash", /*optional=*/true, "hex hash of the submitted block (when reachable)"},
             {RPCResult::Type::STR, "reject_reason", /*optional=*/true, "validation state ToString or decode error"},
         }},
@@ -1870,14 +1882,23 @@ static RPCHelpMan submit_mining_response()
         const bool use_merkle = chainman.GetConsensus().IsVdfSpvActive(next_height);
         block.hashPoW = block.pow.GetCommitment(use_merkle);
 
-        // Parent cumulative_tick from disk when available, else from the
-        // pending-parent registry. The latter matters when THIS block's parent
-        // is still in Full validation and its body is not on disk.
-        if (auto parent_ct = GetBuildAheadParentCumulativeTick(chainman, block.hashPrevBlock)) {
-            block.cumulative_tick = *parent_ct + block.pow.tick;
-        } else {
-            block.cumulative_tick = block.pow.tick;
+        // A durable child may outlive the in-memory pending-parent registry.
+        // Missing parent state is retriable; fabricating a lower cumulative tick
+        // would turn a valid solution into a deterministic consensus reject.
+        const auto parent_tick{
+            GetBuildAheadParentCumulativeTick(chainman, block.hashPrevBlock)};
+        if (!parent_tick) {
+            return reject(
+                "parent_state_unavailable",
+                "parent cumulative tick is unavailable");
         }
+        const auto cumulative_tick{CheckedCumulativeTick(*parent_tick, block.pow.tick)};
+        if (!cumulative_tick) {
+            return reject(
+                "invalid_payload",
+                "cumulative tick overflow");
+        }
+        block.cumulative_tick = *cumulative_tick;
     }
 
     // QuickVerify before submission, mirroring SolutionReceiverLoop:452-458.

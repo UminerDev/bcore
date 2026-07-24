@@ -43,7 +43,7 @@ P2_OP_TRUE_HEX = "51"
 
 class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
     def set_test_params(self):
-        self.num_nodes = 4
+        self.num_nodes = 5
         self.setup_clean_chain = True
         common = [
             "-validationapi=mock",
@@ -54,6 +54,7 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         self.extra_args = [
             common + ["-mockval-default-full=full_green"],
             common + ["-miningbuildaheadpeers=0"],
+            common + ["-miningbuildaheadpeers=1"],
             common + ["-miningbuildaheadpeers=1"],
             common + ["-miningbuildaheadpeers=1"],
         ]
@@ -161,11 +162,12 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
             / "vdf_test_helper"
         )
 
-        source, default_peer, enabled_peer, submit_peer = self.nodes
+        source, default_peer, enabled_peer, submit_peer, restart_peer = self.nodes
         genesis = source.getbestblockhash()
         assert_equal(default_peer.getbestblockhash(), genesis)
         assert_equal(enabled_peer.getbestblockhash(), genesis)
         assert_equal(submit_peer.getbestblockhash(), genesis)
+        assert_equal(restart_peer.getbestblockhash(), genesis)
 
         registered = [
             model
@@ -196,16 +198,20 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         default_link = default_peer.add_p2p_connection(P2PInterface())
         enabled_link = enabled_peer.add_p2p_connection(P2PInterface())
         submit_link = submit_peer.add_p2p_connection(P2PInterface())
+        restart_link = restart_peer.add_p2p_connection(P2PInterface())
         default_link.send_and_ping(msg_block(block_a))
         enabled_link.send_and_ping(msg_block(block_a))
         submit_link.send_and_ping(msg_block(block_a))
+        restart_link.send_and_ping(msg_block(block_a))
 
         assert_equal(default_peer.getbestblockhash(), genesis)
         assert_equal(enabled_peer.getbestblockhash(), genesis)
         assert_equal(submit_peer.getbestblockhash(), genesis)
+        assert_equal(restart_peer.getbestblockhash(), genesis)
         assert self._advertised_parent(default_peer) is None
         assert_equal(self._advertised_parent(enabled_peer), a_hash)
         assert_equal(self._advertised_parent(submit_peer), a_hash)
+        assert_equal(self._advertised_parent(restart_peer), a_hash)
 
         self.log.info("Opt-in node can mint a coinbase-only child of peer block A")
         child = enabled_peer.create_mining_work_unit(
@@ -214,10 +220,47 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         assert_equal(child["tip_hash"], a_hash)
         assert_equal(child["height"], 2)
 
+        self.log.info("Restarted speculative child fails retriably when parent state is absent")
+        restart_child = restart_peer.create_mining_work_unit(
+            REGTEST_NETWORK, P2_OP_TRUE_HEX, "", a_hash
+        )
+        restart_solution = solve_work_unit(
+            restart_child["header_prefix"], restart_child["target"]
+        )
+        restart_payload = build_mining_response(
+            restart_child["req_id"],
+            restart_solution,
+            model_identifier=model_id,
+        )
+        self.restart_node(4)
+        restart_peer = self.nodes[4]
+        restart_result = restart_peer.submit_mining_response(
+            restart_child["req_id"],
+            restart_payload,
+        )
+        assert_equal(restart_result["accepted"], False)
+        assert_equal(restart_result["status"], "parent_state_unavailable")
+
         self.log.info("A child submitted before peer parent Full completes is retained")
         submit_child = submit_peer.create_mining_work_unit(
             REGTEST_NETWORK, P2_OP_TRUE_HEX, "", a_hash
         )
+        self.log.info(
+            "Refresh-under-load keeps the oldest in-flight child addressable"
+        )
+        refreshed_ids = {submit_child["req_id"]}
+        for refresh in range(1, 17):
+            refreshed = submit_peer.create_mining_work_unit(
+                REGTEST_NETWORK,
+                P2_OP_TRUE_HEX,
+                ("%02x" % refresh),
+                a_hash,
+            )
+            assert_equal(refreshed["tip_hash"], a_hash)
+            assert refreshed["req_id"] not in refreshed_ids
+            refreshed_ids.add(refreshed["req_id"])
+        assert_equal(len(refreshed_ids), 17)
+
         child_template = self._journal_block(
             submit_peer,
             submit_child["req_id"],
@@ -285,6 +328,16 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         assert not child_error, child_error
         assert_equal(child_result["accepted"], True)
         assert_equal(child_result["status"], "accepted")
+        assert_equal(submit_peer.getbestblockhash(), child_hash)
+
+        self.log.info(
+            "After soft rotation completes, fresh work immediately follows the new tip"
+        )
+        next_tip_work = submit_peer.create_mining_work_unit(
+            REGTEST_NETWORK, P2_OP_TRUE_HEX, "ff"
+        )
+        assert_equal(next_tip_work["tip_hash"], child_hash)
+        assert_equal(next_tip_work["height"], 3)
 
         self.log.info("Full Amber and Red each fail closed")
         for full_status in ("full_amber", "full_red"):

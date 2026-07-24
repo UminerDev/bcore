@@ -28,6 +28,7 @@
 
 #include <test/util/setup_common.h>
 
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -72,6 +73,22 @@ struct MinerTestingSetup : public TestingSetup {
 } // namespace miner_tests
 
 BOOST_FIXTURE_TEST_SUITE(miner_tests, MinerTestingSetup)
+
+BOOST_AUTO_TEST_CASE(cumulative_tick_addition_fails_closed)
+{
+    const uint64_t max{std::numeric_limits<uint64_t>::max()};
+    BOOST_CHECK_EQUAL(*node::CheckedCumulativeTick(10, 20), 30);
+    BOOST_CHECK_EQUAL(*node::CheckedCumulativeTick(max, 0), max);
+    BOOST_CHECK(!node::CheckedCumulativeTick(max, 1).has_value());
+    BOOST_CHECK(!node::CheckedCumulativeTick(max - 4, 5).has_value());
+
+    const uint256 unknown_parent{};
+    LOCK(::cs_main);
+    BOOST_CHECK(!node::GetBuildAheadChildCumulativeTick(
+        *m_node.chainman,
+        unknown_parent,
+        1).has_value());
+}
 
 static CFeeRate blockMinFeeRate = CFeeRate(DEFAULT_BLOCK_MIN_TX_FEE);
 

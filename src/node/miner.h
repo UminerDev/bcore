@@ -59,6 +59,18 @@ std::optional<uint64_t> GetBuildAheadParentCumulativeTick(
     ChainstateManager& chainman,
     const uint256& prev_hash);
 
+/** Add a child tick without allowing the cumulative counter to wrap. */
+std::optional<uint64_t> CheckedCumulativeTick(uint64_t parent_tick, uint64_t child_tick);
+
+/**
+ * Derive a child's cumulative tick from an on-disk or pending parent.
+ * Missing parent state and arithmetic overflow both fail closed.
+ */
+std::optional<uint64_t> GetBuildAheadChildCumulativeTick(
+    ChainstateManager& chainman,
+    const uint256& prev_hash,
+    uint64_t child_tick);
+
 /**
  * Select the best Quick/Smell-approved parent exactly one block above the
  * active tip. Peer-originated parents require -miningbuildaheadpeers=1.

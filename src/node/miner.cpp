@@ -77,6 +77,27 @@ std::optional<uint64_t> GetBuildAheadParentCumulativeTick(
     return std::nullopt;
 }
 
+std::optional<uint64_t> CheckedCumulativeTick(uint64_t parent_tick, uint64_t child_tick)
+{
+    if (child_tick > std::numeric_limits<uint64_t>::max() - parent_tick) {
+        return std::nullopt;
+    }
+    return parent_tick + child_tick;
+}
+
+std::optional<uint64_t> GetBuildAheadChildCumulativeTick(
+    ChainstateManager& chainman,
+    const uint256& prev_hash,
+    uint64_t child_tick)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    const auto parent_tick{GetBuildAheadParentCumulativeTick(chainman, prev_hash)};
+    if (!parent_tick) {
+        return std::nullopt;
+    }
+    return CheckedCumulativeTick(*parent_tick, child_tick);
+}
+
 bool RecordPendingBuildAheadBlock(
     ChainstateManager& chainman,
     const CBlock& block,
@@ -89,14 +110,12 @@ bool RecordPendingBuildAheadBlock(
     if (pindex == nullptr || pprev == nullptr || pindex->pprev != pprev) {
         return false;
     }
-    const std::optional<uint64_t> parent_tick{
-        GetBuildAheadParentCumulativeTick(chainman, block.hashPrevBlock)};
-    if (!parent_tick ||
-        block.pow.tick > std::numeric_limits<uint64_t>::max() - *parent_tick) {
+    const auto cumulative_tick{
+        GetBuildAheadChildCumulativeTick(chainman, block.hashPrevBlock, block.pow.tick)};
+    if (!cumulative_tick) {
         return false;
     }
-    const uint64_t cumulative_tick{*parent_tick + block.pow.tick};
-    if (block.cumulative_tick != cumulative_tick) {
+    if (block.cumulative_tick != *cumulative_tick) {
         LogPrintLevel(
             BCLog::VALIDATION,
             BCLog::Level::Warning,
@@ -104,7 +123,7 @@ bool RecordPendingBuildAheadBlock(
             "(body=%llu, derived=%llu)\n",
             block.GetHash().ToString(),
             static_cast<unsigned long long>(block.cumulative_tick),
-            static_cast<unsigned long long>(cumulative_tick));
+            static_cast<unsigned long long>(*cumulative_tick));
         return false;
     }
 
@@ -114,13 +133,13 @@ bool RecordPendingBuildAheadBlock(
         PendingBuildAheadBlock{
             pindex->nHeight,
             block.hashPrevBlock,
-            cumulative_tick,
+            *cumulative_tick,
             owned});
     if (!inserted) {
         it->second.owned = it->second.owned || owned;
         it->second.height = pindex->nHeight;
         it->second.prev_hash = block.hashPrevBlock;
-        it->second.cumulative_tick = cumulative_tick;
+        it->second.cumulative_tick = *cumulative_tick;
     }
 
     // Eligibility is always rechecked against the live active tip. Pruning is
@@ -542,19 +561,19 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     {
         const CBlockIndex* prev_index = pindexPrev;
         if (prev_index != nullptr) {
-            uint64_t prev_cum{0};
             if (m_options.prev_block_hash) {
-                const auto pending_cum{
-                    GetBuildAheadParentCumulativeTick(
+                const auto cumulative_tick{
+                    GetBuildAheadChildCumulativeTick(
                         m_chainstate.m_chainman,
-                        *m_options.prev_block_hash)};
-                if (!pending_cum) {
+                        *m_options.prev_block_hash,
+                        pblock->pow.tick)};
+                if (!cumulative_tick) {
                     throw std::runtime_error(strprintf(
-                        "%s: build-ahead parent %s has no cumulative tick",
+                        "%s: build-ahead parent %s has no usable cumulative tick",
                         __func__,
                         m_options.prev_block_hash->ToString()));
                 }
-                prev_cum = *pending_cum;
+                pblock->cumulative_tick = *cumulative_tick;
             } else {
                 CBlock prev_block;
                 if (!m_chainstate.m_chainman.m_blockman.ReadBlock(
@@ -562,16 +581,16 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
                         *prev_index)) {
                     return nullptr;
                 }
-                prev_cum = prev_block.cumulative_tick;
+                const auto cumulative_tick{
+                    CheckedCumulativeTick(prev_block.cumulative_tick, pblock->pow.tick)};
+                if (!cumulative_tick) {
+                    throw std::runtime_error(strprintf(
+                        "%s: cumulative tick overflow for parent %s",
+                        __func__,
+                        prev_index->GetBlockHash().ToString()));
+                }
+                pblock->cumulative_tick = *cumulative_tick;
             }
-            const uint64_t tick{pblock->pow.tick}; // default may be 0
-            if (tick > std::numeric_limits<uint64_t>::max() - prev_cum) {
-                throw std::runtime_error(strprintf(
-                    "%s: cumulative tick overflow for parent %s",
-                    __func__,
-                    prev_index->GetBlockHash().ToString()));
-            }
-            pblock->cumulative_tick = prev_cum + tick;
         }
     }
 
