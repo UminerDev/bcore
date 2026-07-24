@@ -77,7 +77,7 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         }
 
     @staticmethod
-    def _solved_block(node, req_id, solution, model_id, parent_cumulative_tick):
+    def _journal_block(node, req_id):
         journal = (
             Path(node.datadir_path)
             / REGTEST_NETWORK
@@ -91,7 +91,18 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
 
         block = CBlock()
         block.deserialize(BytesIO(raw[8:-32]))
+        return block
 
+    @classmethod
+    def _solved_block(
+        cls,
+        node,
+        req_id,
+        solution,
+        model_id,
+        parent_cumulative_tick,
+    ):
+        block = cls._journal_block(node, req_id)
         proof = CProofBlob()
         proof.version = 1
         proof.tick = solution["tick"]
@@ -206,6 +217,14 @@ class BrokerMiningPeerBuildAheadTest(BitcoinTestFramework):
         self.log.info("A child submitted before peer parent Full completes is retained")
         submit_child = submit_peer.create_mining_work_unit(
             REGTEST_NETWORK, P2_OP_TRUE_HEX, "", a_hash
+        )
+        child_template = self._journal_block(
+            submit_peer,
+            submit_child["req_id"],
+        )
+        assert_equal(
+            child_template.cumulative_tick,
+            block_a.cumulative_tick + child_template.pow.tick,
         )
         solution = solve_work_unit(
             submit_child["header_prefix"], submit_child["target"]

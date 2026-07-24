@@ -542,12 +542,36 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock()
     {
         const CBlockIndex* prev_index = pindexPrev;
         if (prev_index != nullptr) {
-            CBlock prev_block;
-            if (m_chainstate.m_chainman.m_blockman.ReadBlock(prev_block, *prev_index)) {
-                uint64_t prev_cum = prev_block.cumulative_tick;
-                uint64_t tick = pblock->pow.tick; // default may be 0
-                pblock->cumulative_tick = prev_cum + tick;
+            uint64_t prev_cum{0};
+            if (m_options.prev_block_hash) {
+                const auto pending_cum{
+                    GetBuildAheadParentCumulativeTick(
+                        m_chainstate.m_chainman,
+                        *m_options.prev_block_hash)};
+                if (!pending_cum) {
+                    throw std::runtime_error(strprintf(
+                        "%s: build-ahead parent %s has no cumulative tick",
+                        __func__,
+                        m_options.prev_block_hash->ToString()));
+                }
+                prev_cum = *pending_cum;
+            } else {
+                CBlock prev_block;
+                if (!m_chainstate.m_chainman.m_blockman.ReadBlock(
+                        prev_block,
+                        *prev_index)) {
+                    return nullptr;
+                }
+                prev_cum = prev_block.cumulative_tick;
             }
+            const uint64_t tick{pblock->pow.tick}; // default may be 0
+            if (tick > std::numeric_limits<uint64_t>::max() - prev_cum) {
+                throw std::runtime_error(strprintf(
+                    "%s: cumulative tick overflow for parent %s",
+                    __func__,
+                    prev_index->GetBlockHash().ToString()));
+            }
+            pblock->cumulative_tick = prev_cum + tick;
         }
     }
 
